@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>守护番茄镇 - 免费在线RTS网页游戏 | 打开浏览器即玩</title>
+  <meta name="description" content="守护番茄镇是一款免费的即时战略(RTS)网页游戏：指挥步兵、重装机甲与支援小队，抵御三线混编敌军的进攻，在 8 分钟内守住 10 个番茄。无需下载，打开浏览器即玩。">
+  <meta name="keywords" content="守护番茄镇,RTS,即时战略,网页游戏,在线游戏,免费游戏,策略游戏,HTML5游戏,浏览器游戏">
+  <meta name="author" content="守护番茄镇">
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='14.8' y='4' width='2.4' height='6' rx='1' fill='%232f7a3a'/%3E%3Cellipse cx='16' cy='10' rx='7' ry='3' fill='%233f9b4f'/%3E%3Ccircle cx='16' cy='19' r='11' fill='%23e8402a'/%3E%3Cellipse cx='12' cy='16' rx='4' ry='2.5' fill='%23ff6b52'/%3E%3C/svg%3E">
+  <!-- Open Graph 分享卡片 -->
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="守护番茄镇">
+  <meta property="og:title" content="守护番茄镇 - 免费在线RTS网页游戏">
+  <meta property="og:description" content="指挥步兵、重装机甲与支援小队，在 8 分钟内守住 10 个番茄。免费即时战略网页游戏，打开浏览器即玩。">
+  <meta property="og:image" content="./bg.jpg">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="守护番茄镇 - 免费在线RTS网页游戏">
+  <meta name="twitter:description" content="8 分钟番茄防线保卫战，免费即时战略网页游戏。">
+  <!-- 结构化数据：帮助搜索引擎理解这是一个可玩的网页游戏 -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "VideoGame",
+    "name": "守护番茄镇",
+    "description": "免费的即时战略(RTS)网页游戏：指挥步兵、重装机甲与支援小队，抵御三线混编敌军的进攻，在 8 分钟内守住 10 个番茄。",
+    "genre": ["RTS", "即时战略", "策略游戏"],
+    "gamePlatform": "Web Browser",
+    "applicationCategory": "Game",
+    "playMode": "SinglePlayer",
+    "operatingSystem": "Any (HTML5 浏览器)",
+    "image": "./bg.jpg",
+    "inLanguage": "zh-CN",
+    "offers": { "@type": "Offer", "price": "0", "priceCurrency": "CNY", "availability": "https://schema.org/InStock" }
+  }
+  </script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #0d1117;
+      color: #e8edf4;
+      font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
+      line-height: 1.7;
+      overflow-x: hidden;
+    }
+    a { color: #9fe3ff; text-decoration: none; }
+
+    /* 首屏：bg.jpg 背景 + 标题 + 开始按钮 */
+    .hero {
+      position: relative;
+      min-height: 92vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      padding: 40px 20px;
+      background: #0d1117 url('./bg.jpg') center/cover no-repeat;
+    }
+    .hero::before {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(180deg, rgba(13,17,23,0.55) 0%, rgba(13,17,23,0.25) 45%, rgba(13,17,23,0.88) 100%);
+    }
+    .hero > * { position: relative; }
+    .hero h1 {
+      font-size: clamp(44px, 8vw, 96px);
+      font-weight: 900;
+      color: #ffffff;
+      letter-spacing: 0.08em;
+      text-shadow: 0 4px 18px rgba(0,0,0,0.65);
+    }
+    .rainbow {
+      width: min(520px, 70vw);
+      height: 10px;
+      border-radius: 6px;
+      margin: 22px auto 20px;
+      background: linear-gradient(90deg, #ff4d4d, #ff9f43, #ffd93d, #6bcb77, #4d96ff, #9b59b6);
+      box-shadow: 0 3px 12px rgba(0,0,0,0.45);
+    }
+    .hero p.tagline {
+      font-size: clamp(16px, 2.4vw, 22px);
+      color: #f2f6fb;
+      text-shadow: 0 2px 8px rgba(0,0,0,0.6);
+      max-width: 720px;
+    }
+    .cta-row { margin-top: 36px; display: flex; gap: 18px; flex-wrap: wrap; justify-content: center; }
+    .btn {
+      display: inline-block;
+      padding: 15px 46px;
+      border-radius: 14px;
+      font-size: 22px;
+      font-weight: 700;
+      letter-spacing: 4px;
+      cursor: pointer;
+      transition: transform 0.12s ease, box-shadow 0.12s ease;
+    }
+    .btn:hover { transform: translateY(-2px); box-shadow: 0 8px 22px rgba(0,0,0,0.4); }
+    .btn-primary { background: #27ae60; color: #ffffff; border: 2px solid rgba(255,255,255,0.75); }
+    .btn-ghost { background: rgba(13,17,23,0.6); color: #9fe3ff; border: 2px solid #9fe3ff; }
+
+    /* 通用区块 */
+    section { max-width: 1080px; margin: 0 auto; padding: 64px 24px; }
+    section h2 {
+      font-size: clamp(26px, 3.6vw, 34px);
+      color: #ffffff;
+      margin-bottom: 8px;
+    }
+    section .sub { color: #93a4bd; margin-bottom: 34px; }
+    .accent { color: #ff6b52; }
+
+    /* 特色卡片 */
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 18px; }
+    .card {
+      background: #161b26;
+      border: 1px solid #2a3140;
+      border-radius: 14px;
+      padding: 22px 20px;
+    }
+    .card .icon { font-size: 30px; }
+    .card h3 { color: #9fe3ff; font-size: 18px; margin: 10px 0 8px; }
+    .card p { color: #b8c4d6; font-size: 15px; }
+
+    /* 玩法步骤 */
+    .steps { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 18px; counter-reset: step; }
+    .step {
+      background: #12161f;
+      border-left: 4px solid #27ae60;
+      border-radius: 10px;
+      padding: 18px 18px 18px 20px;
+    }
+    .step b { color: #ffd93d; display: block; margin-bottom: 6px; font-size: 16px; }
+    .step span { color: #b8c4d6; font-size: 15px; }
+
+    /* 胜负规则 */
+    .rules {
+      background: #161b26;
+      border: 1px solid #2a3140;
+      border-radius: 14px;
+      padding: 24px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 20px;
+    }
+    .rule h3 { margin-bottom: 8px; }
+    .rule.win h3 { color: #6bcb77; }
+    .rule.lose h3 { color: #ff6b52; }
+    .rule p { color: #b8c4d6; font-size: 15px; }
+
+    footer {
+      border-top: 1px solid #232a36;
+      padding: 28px 24px 40px;
+      text-align: center;
+      color: #6d7b90;
+      font-size: 14px;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- 首屏 -->
+  <header class="hero">
+    <h1>守护番茄镇</h1>
+    <div class="rainbow"></div>
+    <p class="tagline">免费即时战略（RTS）网页游戏——指挥你的小队，在 8 分钟内挡住敌军洪流，守住镇上的番茄！</p>
+    <div class="cta-row">
+      <a class="btn btn-primary" href="./first_in.html">准备行动</a>
+      <a class="btn btn-ghost" href="#howto">玩法说明</a>
+    </div>
+  </header>
+
+  <!-- 游戏特色 -->
+  <section id="features">
+    <h2>游戏特色</h2>
+    <p class="sub">三大兵种体系 × 三线混编敌军 × 一局 8 分钟的快节奏攻防</p>
+    <div class="cards">
+      <div class="card"><div class="icon">🪖</div><h3>步兵小队</h3><p>三人小队，三角阵型自动保持，齐射火力压制正面之敌。</p></div>
+      <div class="card"><div class="icon">🛡️</div><h3>重装机甲</h3><p>主战坦克、机甲：远程炮击、范围爆炸，正面战线的定海神针。</p></div>
+      <div class="card"><div class="icon">💯</div><h3>支援单位</h3><p>双人狙击组、代理人、404 特遣队——点数经济下的高性价比战力。</p></div>
+      <div class="card"><div class="icon">⚔️</div><h3>敌方三线进攻</h3><p>三线混编 12 种敌方兵种：盾卫冲锋、狙击点名、重甲冲撞，各有战术分工。</p></div>
+    </div>
+  </section>
+
+  <!-- 玩法说明 -->
+  <section id="howto">
+    <h2>玩法说明</h2>
+    <p class="sub">四步上手，一分钟理解整局游戏</p>
+    <div class="steps">
+      <div class="step"><b>① 出兵</b><span>点击左上角 GRF 按钮展开兵种面板，花费点数招募小队。点数随时间自动增长（+240/分钟）。</span></div>
+      <div class="step"><b>② 指挥</b><span>框选或点选我方单位，右键下达移动指令；攻击自动进行，重装机甲需要面向敌人才能开火。</span></div>
+      <div class="step"><b>③ 防线</b><span>敌方突破出生点会吃掉番茄：番茄 ×10 归零即落败，8 分钟倒计时结束番茄有剩余则胜利。</span></div>
+      <div class="step"><b>④ 出售与再部署</b><span>阵线吃紧时出售单位回收 80% 点数，把经济腾给更关键的反制兵种。</span></div>
+    </div>
+  </section>
+
+  <!-- 胜负规则 -->
+  <section id="rules">
+    <h2>胜负规则</h2>
+    <p class="sub">一局一胜负，规则一句话讲清</p>
+    <div class="rules">
+      <div class="rule win"><h3>🏆 胜利条件</h3><p>8 分钟倒计时结束时，番茄数量 &gt; 0——防线守住了，游戏胜利。</p></div>
+      <div class="rule lose"><h3>💀 落败条件</h3><p>敌方单位突破出生点，每个敌军吃掉 1 个番茄；10 个番茄全部被吃光即游戏结束。</p></div>
+    </div>
+  </section>
+
+  <!-- 底部 CTA -->
+  <section style="text-align:center; padding-bottom:80px;">
+    <h2>准备好守护番茄了吗？</h2>
+    <p class="sub">无需下载安装，打开浏览器就能开一局</p>
+    <a class="btn btn-primary" href="./first_in.html">准备行动</a>
+  </section>
+
+  <footer>
+    守护番茄镇 · 免费在线即时战略网页游戏 · 本页面为游戏介绍，点击「准备行动」进入游戏
+  </footer>
+
+</body>
+</html>

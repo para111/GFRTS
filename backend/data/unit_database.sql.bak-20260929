@@ -1,0 +1,3427 @@
+-- ============================================================================
+-- 单位数据库：七个兵种表（我方步兵 / 重甲 / 支援 / 战场雇佣 + 敌方步兵 / 重甲 / 支援）
+--
+-- 字段设计来源：RTS.xlsx（A 列字段名 / B 列类型 / C 列说明 / D~G 列出兵单位 id 约定）
+--   unit_id(infantry / heavy_tank / medic / inf_temp) / cost / build_time / max_hp / armor /
+--   move_speed / action_range / action_value / action_cd / target_type
+-- 在此基础上按需求补充：armor_penetration（破甲值）
+-- 以及代码内使用的静态数值列（编队、碰撞体、红区净空、回血、自爆、冲锋、动画、敌方 AI），
+-- 字段名与类型可自行调整，方便后续继续设计数值。
+--
+-- 七张表结构完全一致（列定义相同），只是数据不同，便于横向对比与 UNION 查询。
+-- 对某一方不适用的列留 NULL（例如敌方没有回血与队员隔离，我方没有追踪 AI）。
+--
+-- 尺寸标定基准：现役单位的人物显示尺寸统一标定为 50×50 像素，
+--   因此身体相关的像素列（character_scale / collision_radius / member_collision_radius /
+--   formation_side / red_zone_clearance / member_separation / 移动与归队速度 /
+--   bar_width / shadow_offset_y / ring_* / 敌方隔离与巡逻参数等）都按同一比例
+--   1.875 标定（旧值以 26 像素高的人物为基准 → ×1.875 后显示高度落在 49~53 像素），
+--   我方渲染缩放 = 0.30 × 1.875 = 0.5625，敌方 = 0.145 × 1.875 = 0.272。
+--   射程（action_range / track_range）、自爆半径（detonate_radius）与击退距离
+--   （knockback_distance）是需求里明确指定的绝对值，不随人物尺寸缩放，保持原值。
+--
+-- 本文件是单位数值的唯一真源：WG.html 不再内联任何单位数值，页面启动时直接读取
+--   build_unit_db.py 从本文件生成的 unit_db.js（window.UNIT_DB）。
+--   改数值流程：编辑本文件 -> 运行 `python build_unit_db.py` -> 刷新页面。
+-- 填写约定：现役单位（如下表 player_infantry.JF / enemy_infantry.Vespid）必须填满所有列；
+--   其他兵种的数值若尚未设计，可以只填 unit_id 与已知字段，其余列直接省略（视同未填）。
+-- 语法：通用 SQL（SQLite / MySQL 均可直接执行），可重复执行（每次先删表再建表）。
+-- ============================================================================
+
+DROP TABLE IF EXISTS player_infantry;
+CREATE TABLE player_infantry (  -- infantry（现役单位 JF）
+  unit_id                        VARCHAR(32) NOT NULL PRIMARY KEY,  -- 单位唯一标识
+  unit_name                      VARCHAR(32) DEFAULT NULL,  -- 显示名
+  cost                           INT NOT NULL DEFAULT 0,  -- 招募消耗：出兵时从可用点数中一次性扣除的点数
+  build_time                     FLOAT NOT NULL DEFAULT 0,  -- 训练耗时（秒）
+  max_hp                         INT NOT NULL DEFAULT 1,  -- 最大生命值
+  armor                          INT NOT NULL DEFAULT 0,  -- 固定减伤护甲
+  move_speed                     FLOAT NOT NULL DEFAULT 0,  -- 移动速度（像素/秒）
+  action_range                   FLOAT NOT NULL DEFAULT 0,  -- 攻击/作用距离（像素）
+  action_value                   INT NOT NULL DEFAULT 0,  -- 作用数值（正为伤害/治疗）
+  action_cd                      FLOAT NOT NULL DEFAULT 0,  -- 技能冷却/攻击间隔（秒）
+  target_type                    INT NOT NULL DEFAULT 0 CHECK (target_type IN (0, 1)),  -- 作用目标判定：0 = 敌方单位，1 = 我方单位（支援单位对我方回血用）
+  armor_penetration              INT NOT NULL DEFAULT 0,  -- 破甲值：对拥有护甲的敌人能减去的护甲值
+  -- ---- 以下为代码内使用的静态数值（自定字段名与类型）----
+  squad_size                     INT DEFAULT 1,  -- 编队人数：多人独立碰撞体、合并为一个基本单位
+  squad_cap                      INT DEFAULT 1,  -- 该兵种可同时出场的单位数量上限（含训练中）
+  roster                         VARCHAR(128) DEFAULT NULL,  -- 编队花名册（逗号分隔；最后一项为队长）
+  character_scale                FLOAT DEFAULT NULL,  -- 角色渲染缩放
+  collision_radius               FLOAT DEFAULT NULL,  -- 单位移动碰撞体半径
+  member_collision_radius        FLOAT DEFAULT NULL,  -- 单名队员的圆形判定体半径
+  formation_side                 FLOAT DEFAULT NULL,  -- 三角阵型边长
+  red_zone_clearance             FLOAT DEFAULT NULL,  -- 与红色屏蔽区边缘保持的安全距离
+  member_separation              FLOAT DEFAULT NULL,  -- 队员之间的最小间距
+  member_enemy_separation        FLOAT DEFAULT NULL,  -- 队员与敌方单位之间的隔离距离
+  regen_delay                    INT DEFAULT NULL,  -- 距上次受击多久开始回血（毫秒）
+  regen_per_second               FLOAT DEFAULT NULL,  -- 每秒恢复的最大生命值比例
+  detonate_delay                 INT DEFAULT NULL,  -- 血条耗尽到自爆/引爆的延迟（毫秒）
+  detonate_radius                FLOAT DEFAULT NULL,  -- 自爆半径（像素）
+  detonate_damage                FLOAT DEFAULT NULL,  -- 爆心伤害
+  detonate_damage_falloff        FLOAT DEFAULT NULL,  -- 每档伤害递减比例
+  detonate_falloff_step          FLOAT DEFAULT NULL,  -- 伤害递减档距（像素）
+  charge_speed                   FLOAT DEFAULT NULL,  -- 阵亡冲锋速度（像素/秒）
+  charge_trigger_distance        FLOAT DEFAULT NULL,  -- 贴上该距离立即自爆（像素）
+  charge_stun_duration           INT DEFAULT NULL,  -- 冲刺近战命中后目标小队陷入待机的时长（毫秒；Guard/Aegis = 1000，Smasher/Kratos = 3000）；>0 = 启用冲刺近战；留空 = 无冲刺
+  death_tint_duration            INT DEFAULT NULL,  -- 阵亡泛红时长（毫秒）
+  death_tint_strength            FLOAT DEFAULT NULL,  -- 阵亡泛红强度
+  track_range                    FLOAT DEFAULT NULL,  -- 追踪范围（敌方 AI，像素）
+  attack_release_margin          FLOAT DEFAULT NULL,  -- 停火迟滞带（像素）
+  track_release_margin           FLOAT DEFAULT NULL,  -- 放弃追踪迟滞带（像素）
+  -- ---- 部署扣点（经济）----
+  deploy_cost                    INT DEFAULT NULL,  -- 驻场削点：场上每存在一个该兵种，每分钟可获得的点数上限减少该值（不直接扣当前点数）
+  -- ---- 队员隔离与归队（我方）----
+  member_separation_max_push     FLOAT DEFAULT NULL,  -- 队员隔离每帧最大推挤位移（像素）
+  member_anim_max_step           FLOAT DEFAULT NULL,  -- 队员渲染位置每帧最大位移（像素）
+  member_return_distance         FLOAT DEFAULT NULL,  -- 掉队判定距离（像素）
+  member_return_exit_ratio       FLOAT DEFAULT NULL,  -- 归队迟滞比例：收进「判定距离 × 该比例」以内才算归位
+  member_return_extra_clearance  FLOAT DEFAULT NULL,  -- 归位通道净空额外量（像素），最终净空 = red_zone_clearance + 该值
+  member_return_speed            FLOAT DEFAULT NULL,  -- 归队移动速度（像素/秒）
+  member_return_replan_distance  FLOAT DEFAULT NULL,  -- 归队路径的重新规划距离阈值（像素）
+  member_return_waypoint_radius  FLOAT DEFAULT NULL,  -- 归队路径拐点的到达判定距离（像素）
+  -- ---- 阵型与收拢（我方）----
+  squad_regroup_arrive           FLOAT DEFAULT NULL,  -- 归位判定距离（像素）
+  squad_regroup_catchup_distance FLOAT DEFAULT NULL,  -- 落后该距离后开始提速归队（像素）
+  squad_regroup_stall_ratio      FLOAT DEFAULT NULL,  -- 单帧靠近量不足预算的该比例即累计卡滞
+  squad_regroup_stall_frames     INT DEFAULT NULL,  -- 连续卡滞帧数达到该值即视为已归位
+  squad_free_return_ratio        FLOAT DEFAULT NULL,  -- 超出自由散开范围后的回收速度倍率（相对行军速度）
+  squad_separation_target        FLOAT DEFAULT NULL,  -- 队形被挤压时的兜底隔离距离（像素）
+  squad_separation_buffer        FLOAT DEFAULT NULL,  -- 队形隔离的收敛容差
+  squad_order_spread             FLOAT DEFAULT NULL,  -- 多队同时移动时终点圆环分摊半径（像素）：越小越贴近点击点，取值需保证相邻小队贴近而不相叠
+  squad_separation_passes        INT DEFAULT NULL,  -- 队员隔离与红区净空交替求解轮数
+  squad_edge_range               FLOAT DEFAULT NULL,  -- 判定「已贴到红色屏蔽区边缘」的额外距离（像素）
+  squad_edge_exit_range          FLOAT DEFAULT NULL,  -- 贴红区判定的退出迟滞距离（像素）
+  squad_formation_lerp           FLOAT DEFAULT NULL,  -- 行进方向插值系数（避免拐角处方向跳变）
+  squad_morph_duration           INT DEFAULT NULL,  -- 三角阵型与自由散开的过渡时长（毫秒）
+  squad_free_spread              FLOAT DEFAULT NULL,  -- 自由移动时的横向展开量（像素）
+  squad_free_max_distance        FLOAT DEFAULT NULL,  -- 队员与队形中心的最大距离（像素）
+  squad_free_back_left           FLOAT DEFAULT NULL,  -- 自由站位「左侧」沿行进方向的落后量（像素）
+  squad_free_back_apex           FLOAT DEFAULT NULL,  -- 自由站位「中间」沿行进方向的落后量（像素，负为更靠前）
+  squad_free_back_right          FLOAT DEFAULT NULL,  -- 自由站位「右侧」沿行进方向的落后量（像素）
+  squad_slot_swap_blend          FLOAT DEFAULT NULL,  -- 允许重新分配站位所需的散开完成度
+  -- ---- 动画（我方）----
+  attack_animation_name          VARCHAR(32) DEFAULT NULL,  -- 攻击动画名（默认 'attack'；TankM1 等美术攻击动作名不同的单位填 'skill1' 等）
+  animation_mix_attack           FLOAT DEFAULT NULL,  -- 攻击与移动/待机交叉淡化时长（秒）
+  animation_mix_loop             FLOAT DEFAULT NULL,  -- 移动与待机交叉淡化时长（秒）
+  attack_animation_fallback      INT DEFAULT NULL,  -- 取不到攻击动画时长时的兜底锁定时长（毫秒）
+  animation_lock_grace           FLOAT DEFAULT NULL,  -- 一次性动画尾帧保留容差（毫秒）
+  spawn_animation_duration       INT DEFAULT NULL,  -- 出生动画时长（毫秒）
+  spawn_animation_min_scale      FLOAT DEFAULT NULL,  -- 出生动画起始缩放（相对正常体型）
+  -- ---- 红区绕行与移动容错（我方）----
+  red_route_range                FLOAT DEFAULT NULL,  -- 「移动路线范围内」的红区判定半径（像素）
+  red_steer_bias                 FLOAT DEFAULT NULL,  -- 沿红色屏蔽区行走时的额外外扩量（保证净空足额）
+  move_stall_timeout             INT DEFAULT NULL,  -- 贴着红区打转、长时间无法靠近终点的判定时长（毫秒）
+  move_progress_epsilon          FLOAT DEFAULT NULL,  -- 判定「确实靠近了终点」的最小距离（像素）
+  charge_retarget_interval       INT DEFAULT NULL,  -- 阵亡冲锋的重新索敌间隔（毫秒）
+  -- ---- 视觉尺寸 ----
+  bar_width                      FLOAT DEFAULT NULL,  -- 血条宽度（像素）
+  shadow_width_ratio             FLOAT DEFAULT NULL,  -- 脚下阴影宽度 / 单位显示宽度
+  shadow_flatten                 FLOAT DEFAULT NULL,  -- 脚下阴影高度 / 宽度
+  shadow_alpha                   FLOAT DEFAULT NULL,  -- 脚下阴影透明度
+  shadow_offset_y                FLOAT DEFAULT NULL,  -- 脚下阴影相对单位原点的纵向偏移（像素）
+  ring_width                     FLOAT DEFAULT NULL,  -- 脚下选中圆环宽度（像素）
+  ring_height                    FLOAT DEFAULT NULL,  -- 脚下选中圆环高度（像素）
+  ring_offset_y                  FLOAT DEFAULT NULL,  -- 脚下选中圆环纵向偏移（像素）
+  -- ---- 敌方 AI 与行动路线 ----
+  hold_duration                  INT DEFAULT NULL,  -- 行动点待机时长（毫秒）
+  patrol_radius                  FLOAT DEFAULT NULL,  -- 待机巡逻范围半径（像素）
+  patrol_min_radius              FLOAT DEFAULT NULL,  -- 巡逻折返的最小半径（像素）
+  patrol_slack                   FLOAT DEFAULT NULL,  -- 巡逻硬约束容差（像素）
+  endpoint_roam_radius           FLOAT DEFAULT NULL,  -- 路线终点自由待机区域半径（像素）
+  endpoint_idle_min              INT DEFAULT NULL,  -- 终点到位后随机静止时长下限（毫秒）
+  endpoint_idle_max              INT DEFAULT NULL,  -- 终点到位后随机静止时长上限（毫秒）
+  endpoint_return_slack_factor   FLOAT DEFAULT NULL,  -- 终点回位距离 = 待机半径 + patrol_slack × 该系数
+  route_corridor                 FLOAT DEFAULT NULL,  -- 移动路线走廊半宽（像素）
+  route_variant_count            INT DEFAULT NULL,  -- 每条主路线生成的随机变体数量
+  spawn_offmap_padding           FLOAT DEFAULT NULL,  -- 出生点在地图外额外补足的入场距离（像素）
+  separation_strength            FLOAT DEFAULT NULL,  -- 单位隔离每帧推开重叠量的比例
+  separation_max_push            FLOAT DEFAULT NULL,  -- 单位隔离每帧最大推挤位移（像素）
+  replan_cooldown                INT DEFAULT NULL,  -- 路径重规划冷却（毫秒）
+  stuck_time                     INT DEFAULT NULL,  -- 卡滞判定时长（毫秒）
+  stuck_distance                 FLOAT DEFAULT NULL,  -- 卡滞判定位移阈值（像素）
+  attack_contact_tolerance       FLOAT DEFAULT NULL,  -- 进入攻击范围的到位容差（像素）
+  attack_animation_loop          INT DEFAULT NULL,  -- 攻击姿态是否循环播放（1 = 循环）
+  knockback_distance             FLOAT DEFAULT NULL,  -- 被击中后的击退距离（像素）
+  knockback_duration             INT DEFAULT NULL,  -- 被击中后的击退持续时间（毫秒）
+  -- ---- 攻击弹丸与溅射（重装单位）----
+  attack_blast_radius            FLOAT DEFAULT NULL,  -- 攻击溅射半径（像素）：命中点周围该范围内的敌人全部受伤；NULL/0 = 单体攻击
+  attack_blast_falloff           FLOAT DEFAULT NULL,  -- 溅射伤害每档向外递减比例（0.2 = 每档降 20%）
+  attack_blast_falloff_step      FLOAT DEFAULT NULL,  -- 溅射伤害递减档距（像素）
+  attack_projectile_size         FLOAT DEFAULT NULL,  -- 攻击弹丸显示尺寸（像素）：NULL = 无弹丸表现（瞬时命中）
+  attack_while_moving            INT DEFAULT NULL,  -- 移动开火：1 = 行进中也能自动开火（NULL/0 = 只有站定才能开火）
+  attack_while_moving_arc        FLOAT DEFAULT NULL,  -- 移动开火的正面射界半角（度）：只锁定行进方向该角度内的敌人；NULL/<=0 = 不限方向
+  attack_facing_required         INT DEFAULT NULL,  -- 面向判定：1 = 只能面向敌方单位时才能攻击（不面向时先自动转身，并等一个攻击间隔再打）；NULL/0 = 不判定朝向
+  -- ---- 攻击弹丸表现（重装单位）----
+  attack_projectile_speed        FLOAT DEFAULT NULL,  -- 弹丸飞行速度（像素/秒）
+  attack_projectile_launch_ratio FLOAT DEFAULT NULL,  -- 出膛时刻占攻击动画时长的比例（0.5 = 动画播到一半出膛，1 = 播完出膛）
+  attack_projectile_bone         VARCHAR(32) DEFAULT NULL,  -- 出膛点所在的骨骼名（TankM1 / Warjack = muzzle、Ares = muzzle1,muzzle2，多骨骼取距目标最近者）；NULL = 无骨骼，改用下面的兜底偏移估算
+  attack_projectile_muzzle_forward FLOAT DEFAULT NULL,  -- 兜底出膛点：沿射向自单位锚点前移（像素）
+  attack_projectile_muzzle_height FLOAT DEFAULT NULL,  -- 兜底出膛点：自单位锚点上移（像素）
+  -- ---- 多部件外观（Warjack）----
+  render_parts                   VARCHAR(255) DEFAULT NULL,  -- 多部件外观：资源键按「从后到前」排列、逗号分隔，最后一个是主体（血条/炮口/染色都取它）；留空 = 单部件
+  -- ---- 阵亡自爆表现（Ares）----
+  death_charge_animation         VARCHAR(32) DEFAULT NULL,  -- 阵亡冲锋中途切换到的动作名（Ares = skill3）；留空 = 全程用冲锋动作
+  death_charge_animation_delay   INT DEFAULT NULL,  -- 进入自爆状态后多少毫秒切到上面的动作（Ares = 0，一进入自爆状态就直接播 skill3 第一秒）
+  -- ---- 近战（Warjack）----
+  melee_range                    FLOAT DEFAULT NULL,  -- 近战触发距离：自身碰撞体之外再多该距离内有敌人就打近战；留空 = 没有近战
+  melee_animation_name           VARCHAR(32) DEFAULT NULL,  -- 近战动作名（Warjack = attack_SP）
+  melee_ignore_armor             INT DEFAULT NULL,  -- 近战是否无视护甲（1 = 无视，按防守方护甲为 0 结算）
+  -- ---- 外观朝向（Ares）----
+  art_facing_left                INT DEFAULT NULL,  -- 素材本身朝向：1 = 原图朝左（渲染朝向与其它单位相反，Ares）；留空 = 原图朝右
+  -- ---- 开局召唤分身（SF / Agent）----
+  summon_animation_name          VARCHAR(32) DEFAULT NULL,  -- 开局召唤动画（SF = skill2，本体播放）；留空 = 无召唤
+  summon_clone_count             INT DEFAULT NULL,  -- 开局召唤的分身数量（SF = 2，分身数值与机制完全继承本体）；留空 = 不召唤
+  summon_clone_delay             INT DEFAULT NULL   -- 召唤动画播到多少毫秒时分身落地（SF = 1400，skill2 全长 2833ms 的中段）
+);
+
+DROP TABLE IF EXISTS player_heavy;
+CREATE TABLE player_heavy (  -- heavy_tank
+  unit_id                        VARCHAR(32) NOT NULL PRIMARY KEY,  -- 单位唯一标识
+  unit_name                      VARCHAR(32) DEFAULT NULL,  -- 显示名
+  cost                           INT NOT NULL DEFAULT 0,  -- 招募消耗：出兵时从可用点数中一次性扣除的点数
+  build_time                     FLOAT NOT NULL DEFAULT 0,  -- 训练耗时（秒）
+  max_hp                         INT NOT NULL DEFAULT 1,  -- 最大生命值
+  armor                          INT NOT NULL DEFAULT 0,  -- 固定减伤护甲
+  move_speed                     FLOAT NOT NULL DEFAULT 0,  -- 移动速度（像素/秒）
+  action_range                   FLOAT NOT NULL DEFAULT 0,  -- 攻击/作用距离（像素）
+  action_value                   INT NOT NULL DEFAULT 0,  -- 作用数值（正为伤害/治疗）
+  action_cd                      FLOAT NOT NULL DEFAULT 0,  -- 技能冷却/攻击间隔（秒）
+  target_type                    INT NOT NULL DEFAULT 0 CHECK (target_type IN (0, 1)),  -- 作用目标判定：0 = 敌方单位，1 = 我方单位（支援单位对我方回血用）
+  armor_penetration              INT NOT NULL DEFAULT 0,  -- 破甲值：对拥有护甲的敌人能减去的护甲值
+  -- ---- 以下为代码内使用的静态数值（自定字段名与类型）----
+  squad_size                     INT DEFAULT 1,  -- 编队人数：多人独立碰撞体、合并为一个基本单位
+  squad_cap                      INT DEFAULT 1,  -- 该兵种可同时出场的单位数量上限（含训练中）
+  roster                         VARCHAR(128) DEFAULT NULL,  -- 编队花名册（逗号分隔；最后一项为队长）
+  character_scale                FLOAT DEFAULT NULL,  -- 角色渲染缩放
+  collision_radius               FLOAT DEFAULT NULL,  -- 单位移动碰撞体半径
+  member_collision_radius        FLOAT DEFAULT NULL,  -- 单名队员的圆形判定体半径
+  formation_side                 FLOAT DEFAULT NULL,  -- 三角阵型边长
+  red_zone_clearance             FLOAT DEFAULT NULL,  -- 与红色屏蔽区边缘保持的安全距离
+  member_separation              FLOAT DEFAULT NULL,  -- 队员之间的最小间距
+  member_enemy_separation        FLOAT DEFAULT NULL,  -- 队员与敌方单位之间的隔离距离
+  regen_delay                    INT DEFAULT NULL,  -- 距上次受击多久开始回血（毫秒）
+  regen_per_second               FLOAT DEFAULT NULL,  -- 每秒恢复的最大生命值比例
+  detonate_delay                 INT DEFAULT NULL,  -- 血条耗尽到自爆/引爆的延迟（毫秒）
+  detonate_radius                FLOAT DEFAULT NULL,  -- 自爆半径（像素）
+  detonate_damage                FLOAT DEFAULT NULL,  -- 爆心伤害
+  detonate_damage_falloff        FLOAT DEFAULT NULL,  -- 每档伤害递减比例
+  detonate_falloff_step          FLOAT DEFAULT NULL,  -- 伤害递减档距（像素）
+  charge_speed                   FLOAT DEFAULT NULL,  -- 阵亡冲锋速度（像素/秒）
+  charge_trigger_distance        FLOAT DEFAULT NULL,  -- 贴上该距离立即自爆（像素）
+  charge_stun_duration           INT DEFAULT NULL,  -- 冲刺近战命中后目标小队陷入待机的时长（毫秒；Guard/Aegis = 1000，Smasher/Kratos = 3000）；>0 = 启用冲刺近战；留空 = 无冲刺
+  death_tint_duration            INT DEFAULT NULL,  -- 阵亡泛红时长（毫秒）
+  death_tint_strength            FLOAT DEFAULT NULL,  -- 阵亡泛红强度
+  track_range                    FLOAT DEFAULT NULL,  -- 追踪范围（敌方 AI，像素）
+  attack_release_margin          FLOAT DEFAULT NULL,  -- 停火迟滞带（像素）
+  track_release_margin           FLOAT DEFAULT NULL,  -- 放弃追踪迟滞带（像素）
+  -- ---- 部署扣点（经济）----
+  deploy_cost                    INT DEFAULT NULL,  -- 驻场削点：场上每存在一个该兵种，每分钟可获得的点数上限减少该值（不直接扣当前点数）
+  -- ---- 队员隔离与归队（我方）----
+  member_separation_max_push     FLOAT DEFAULT NULL,  -- 队员隔离每帧最大推挤位移（像素）
+  member_anim_max_step           FLOAT DEFAULT NULL,  -- 队员渲染位置每帧最大位移（像素）
+  member_return_distance         FLOAT DEFAULT NULL,  -- 掉队判定距离（像素）
+  member_return_exit_ratio       FLOAT DEFAULT NULL,  -- 归队迟滞比例：收进「判定距离 × 该比例」以内才算归位
+  member_return_extra_clearance  FLOAT DEFAULT NULL,  -- 归位通道净空额外量（像素），最终净空 = red_zone_clearance + 该值
+  member_return_speed            FLOAT DEFAULT NULL,  -- 归队移动速度（像素/秒）
+  member_return_replan_distance  FLOAT DEFAULT NULL,  -- 归队路径的重新规划距离阈值（像素）
+  member_return_waypoint_radius  FLOAT DEFAULT NULL,  -- 归队路径拐点的到达判定距离（像素）
+  -- ---- 阵型与收拢（我方）----
+  squad_regroup_arrive           FLOAT DEFAULT NULL,  -- 归位判定距离（像素）
+  squad_regroup_catchup_distance FLOAT DEFAULT NULL,  -- 落后该距离后开始提速归队（像素）
+  squad_regroup_stall_ratio      FLOAT DEFAULT NULL,  -- 单帧靠近量不足预算的该比例即累计卡滞
+  squad_regroup_stall_frames     INT DEFAULT NULL,  -- 连续卡滞帧数达到该值即视为已归位
+  squad_free_return_ratio        FLOAT DEFAULT NULL,  -- 超出自由散开范围后的回收速度倍率（相对行军速度）
+  squad_separation_target        FLOAT DEFAULT NULL,  -- 队形被挤压时的兜底隔离距离（像素）
+  squad_separation_buffer        FLOAT DEFAULT NULL,  -- 队形隔离的收敛容差
+  squad_order_spread             FLOAT DEFAULT NULL,  -- 多队同时移动时终点圆环分摊半径（像素）：越小越贴近点击点，取值需保证相邻小队贴近而不相叠
+  squad_separation_passes        INT DEFAULT NULL,  -- 队员隔离与红区净空交替求解轮数
+  squad_edge_range               FLOAT DEFAULT NULL,  -- 判定「已贴到红色屏蔽区边缘」的额外距离（像素）
+  squad_edge_exit_range          FLOAT DEFAULT NULL,  -- 贴红区判定的退出迟滞距离（像素）
+  squad_formation_lerp           FLOAT DEFAULT NULL,  -- 行进方向插值系数（避免拐角处方向跳变）
+  squad_morph_duration           INT DEFAULT NULL,  -- 三角阵型与自由散开的过渡时长（毫秒）
+  squad_free_spread              FLOAT DEFAULT NULL,  -- 自由移动时的横向展开量（像素）
+  squad_free_max_distance        FLOAT DEFAULT NULL,  -- 队员与队形中心的最大距离（像素）
+  squad_free_back_left           FLOAT DEFAULT NULL,  -- 自由站位「左侧」沿行进方向的落后量（像素）
+  squad_free_back_apex           FLOAT DEFAULT NULL,  -- 自由站位「中间」沿行进方向的落后量（像素，负为更靠前）
+  squad_free_back_right          FLOAT DEFAULT NULL,  -- 自由站位「右侧」沿行进方向的落后量（像素）
+  squad_slot_swap_blend          FLOAT DEFAULT NULL,  -- 允许重新分配站位所需的散开完成度
+  -- ---- 动画（我方）----
+  attack_animation_name          VARCHAR(32) DEFAULT NULL,  -- 攻击动画名（默认 'attack'；TankM1 等美术攻击动作名不同的单位填 'skill1' 等）
+  animation_mix_attack           FLOAT DEFAULT NULL,  -- 攻击与移动/待机交叉淡化时长（秒）
+  animation_mix_loop             FLOAT DEFAULT NULL,  -- 移动与待机交叉淡化时长（秒）
+  attack_animation_fallback      INT DEFAULT NULL,  -- 取不到攻击动画时长时的兜底锁定时长（毫秒）
+  animation_lock_grace           FLOAT DEFAULT NULL,  -- 一次性动画尾帧保留容差（毫秒）
+  spawn_animation_duration       INT DEFAULT NULL,  -- 出生动画时长（毫秒）
+  spawn_animation_min_scale      FLOAT DEFAULT NULL,  -- 出生动画起始缩放（相对正常体型）
+  -- ---- 红区绕行与移动容错（我方）----
+  red_route_range                FLOAT DEFAULT NULL,  -- 「移动路线范围内」的红区判定半径（像素）
+  red_steer_bias                 FLOAT DEFAULT NULL,  -- 沿红色屏蔽区行走时的额外外扩量（保证净空足额）
+  move_stall_timeout             INT DEFAULT NULL,  -- 贴着红区打转、长时间无法靠近终点的判定时长（毫秒）
+  move_progress_epsilon          FLOAT DEFAULT NULL,  -- 判定「确实靠近了终点」的最小距离（像素）
+  charge_retarget_interval       INT DEFAULT NULL,  -- 阵亡冲锋的重新索敌间隔（毫秒）
+  -- ---- 视觉尺寸 ----
+  bar_width                      FLOAT DEFAULT NULL,  -- 血条宽度（像素）
+  shadow_width_ratio             FLOAT DEFAULT NULL,  -- 脚下阴影宽度 / 单位显示宽度
+  shadow_flatten                 FLOAT DEFAULT NULL,  -- 脚下阴影高度 / 宽度
+  shadow_alpha                   FLOAT DEFAULT NULL,  -- 脚下阴影透明度
+  shadow_offset_y                FLOAT DEFAULT NULL,  -- 脚下阴影相对单位原点的纵向偏移（像素）
+  ring_width                     FLOAT DEFAULT NULL,  -- 脚下选中圆环宽度（像素）
+  ring_height                    FLOAT DEFAULT NULL,  -- 脚下选中圆环高度（像素）
+  ring_offset_y                  FLOAT DEFAULT NULL,  -- 脚下选中圆环纵向偏移（像素）
+  -- ---- 敌方 AI 与行动路线 ----
+  hold_duration                  INT DEFAULT NULL,  -- 行动点待机时长（毫秒）
+  patrol_radius                  FLOAT DEFAULT NULL,  -- 待机巡逻范围半径（像素）
+  patrol_min_radius              FLOAT DEFAULT NULL,  -- 巡逻折返的最小半径（像素）
+  patrol_slack                   FLOAT DEFAULT NULL,  -- 巡逻硬约束容差（像素）
+  endpoint_roam_radius           FLOAT DEFAULT NULL,  -- 路线终点自由待机区域半径（像素）
+  endpoint_idle_min              INT DEFAULT NULL,  -- 终点到位后随机静止时长下限（毫秒）
+  endpoint_idle_max              INT DEFAULT NULL,  -- 终点到位后随机静止时长上限（毫秒）
+  endpoint_return_slack_factor   FLOAT DEFAULT NULL,  -- 终点回位距离 = 待机半径 + patrol_slack × 该系数
+  route_corridor                 FLOAT DEFAULT NULL,  -- 移动路线走廊半宽（像素）
+  route_variant_count            INT DEFAULT NULL,  -- 每条主路线生成的随机变体数量
+  spawn_offmap_padding           FLOAT DEFAULT NULL,  -- 出生点在地图外额外补足的入场距离（像素）
+  separation_strength            FLOAT DEFAULT NULL,  -- 单位隔离每帧推开重叠量的比例
+  separation_max_push            FLOAT DEFAULT NULL,  -- 单位隔离每帧最大推挤位移（像素）
+  replan_cooldown                INT DEFAULT NULL,  -- 路径重规划冷却（毫秒）
+  stuck_time                     INT DEFAULT NULL,  -- 卡滞判定时长（毫秒）
+  stuck_distance                 FLOAT DEFAULT NULL,  -- 卡滞判定位移阈值（像素）
+  attack_contact_tolerance       FLOAT DEFAULT NULL,  -- 进入攻击范围的到位容差（像素）
+  attack_animation_loop          INT DEFAULT NULL,  -- 攻击姿态是否循环播放（1 = 循环）
+  knockback_distance             FLOAT DEFAULT NULL,  -- 被击中后的击退距离（像素）
+  knockback_duration             INT DEFAULT NULL,  -- 被击中后的击退持续时间（毫秒）
+  -- ---- 攻击弹丸与溅射（重装单位）----
+  attack_blast_radius            FLOAT DEFAULT NULL,  -- 攻击溅射半径（像素）：命中点周围该范围内的敌人全部受伤；NULL/0 = 单体攻击
+  attack_blast_falloff           FLOAT DEFAULT NULL,  -- 溅射伤害每档向外递减比例（0.2 = 每档降 20%）
+  attack_blast_falloff_step      FLOAT DEFAULT NULL,  -- 溅射伤害递减档距（像素）
+  attack_projectile_size         FLOAT DEFAULT NULL,  -- 攻击弹丸显示尺寸（像素）：NULL = 无弹丸表现（瞬时命中）
+  attack_while_moving            INT DEFAULT NULL,  -- 移动开火：1 = 行进中也能自动开火（NULL/0 = 只有站定才能开火）
+  attack_while_moving_arc        FLOAT DEFAULT NULL,  -- 移动开火的正面射界半角（度）：只锁定行进方向该角度内的敌人；NULL/<=0 = 不限方向
+  attack_facing_required         INT DEFAULT NULL,  -- 面向判定：1 = 只能面向敌方单位时才能攻击（不面向时先自动转身，并等一个攻击间隔再打）；NULL/0 = 不判定朝向
+  -- ---- 攻击弹丸表现（重装单位）----
+  attack_projectile_speed        FLOAT DEFAULT NULL,  -- 弹丸飞行速度（像素/秒）
+  attack_projectile_launch_ratio FLOAT DEFAULT NULL,  -- 出膛时刻占攻击动画时长的比例（0.5 = 动画播到一半出膛，1 = 播完出膛）
+  attack_projectile_bone         VARCHAR(32) DEFAULT NULL,  -- 出膛点所在的骨骼名（TankM1 / Warjack = muzzle、Ares = muzzle1,muzzle2，多骨骼取距目标最近者）；NULL = 无骨骼，改用下面的兜底偏移估算
+  attack_projectile_muzzle_forward FLOAT DEFAULT NULL,  -- 兜底出膛点：沿射向自单位锚点前移（像素）
+  attack_projectile_muzzle_height FLOAT DEFAULT NULL,  -- 兜底出膛点：自单位锚点上移（像素）
+  -- ---- 多部件外观（Warjack）----
+  render_parts                   VARCHAR(255) DEFAULT NULL,  -- 多部件外观：资源键按「从后到前」排列、逗号分隔，最后一个是主体（血条/炮口/染色都取它）；留空 = 单部件
+  -- ---- 阵亡自爆表现（Ares）----
+  death_charge_animation         VARCHAR(32) DEFAULT NULL,  -- 阵亡冲锋中途切换到的动作名（Ares = skill3）；留空 = 全程用冲锋动作
+  death_charge_animation_delay   INT DEFAULT NULL,  -- 进入自爆状态后多少毫秒切到上面的动作（Ares = 0，一进入自爆状态就直接播 skill3 第一秒）
+  -- ---- 近战（Warjack）----
+  melee_range                    FLOAT DEFAULT NULL,  -- 近战触发距离：自身碰撞体之外再多该距离内有敌人就打近战；留空 = 没有近战
+  melee_animation_name           VARCHAR(32) DEFAULT NULL,  -- 近战动作名（Warjack = attack_SP）
+  melee_ignore_armor             INT DEFAULT NULL,  -- 近战是否无视护甲（1 = 无视，按防守方护甲为 0 结算）
+  -- ---- 外观朝向（Ares）----
+  art_facing_left                INT DEFAULT NULL,  -- 素材本身朝向：1 = 原图朝左（渲染朝向与其它单位相反，Ares）；留空 = 原图朝右
+  -- ---- 开局召唤分身（SF / Agent）----
+  summon_animation_name          VARCHAR(32) DEFAULT NULL,  -- 开局召唤动画（SF = skill2，本体播放）；留空 = 无召唤
+  summon_clone_count             INT DEFAULT NULL,  -- 开局召唤的分身数量（SF = 2，分身数值与机制完全继承本体）；留空 = 不召唤
+  summon_clone_delay             INT DEFAULT NULL   -- 召唤动画播到多少毫秒时分身落地（SF = 1400，skill2 全长 2833ms 的中段）
+);
+
+DROP TABLE IF EXISTS player_support;
+CREATE TABLE player_support (  -- medic（target_type = 1 为我方单位回血）
+  unit_id                        VARCHAR(32) NOT NULL PRIMARY KEY,  -- 单位唯一标识
+  unit_name                      VARCHAR(32) DEFAULT NULL,  -- 显示名
+  cost                           INT NOT NULL DEFAULT 0,  -- 招募消耗：出兵时从可用点数中一次性扣除的点数
+  build_time                     FLOAT NOT NULL DEFAULT 0,  -- 训练耗时（秒）
+  max_hp                         INT NOT NULL DEFAULT 1,  -- 最大生命值
+  armor                          INT NOT NULL DEFAULT 0,  -- 固定减伤护甲
+  move_speed                     FLOAT NOT NULL DEFAULT 0,  -- 移动速度（像素/秒）
+  action_range                   FLOAT NOT NULL DEFAULT 0,  -- 攻击/作用距离（像素）
+  action_value                   INT NOT NULL DEFAULT 0,  -- 作用数值（正为伤害/治疗）
+  action_cd                      FLOAT NOT NULL DEFAULT 0,  -- 技能冷却/攻击间隔（秒）
+  target_type                    INT NOT NULL DEFAULT 0 CHECK (target_type IN (0, 1)),  -- 作用目标判定：0 = 敌方单位，1 = 我方单位（支援单位对我方回血用）
+  armor_penetration              INT NOT NULL DEFAULT 0,  -- 破甲值：对拥有护甲的敌人能减去的护甲值
+  -- ---- 以下为代码内使用的静态数值（自定字段名与类型）----
+  squad_size                     INT DEFAULT 1,  -- 编队人数：多人独立碰撞体、合并为一个基本单位
+  squad_cap                      INT DEFAULT 1,  -- 该兵种可同时出场的单位数量上限（含训练中）
+  roster                         VARCHAR(128) DEFAULT NULL,  -- 编队花名册（逗号分隔；最后一项为队长）
+  character_scale                FLOAT DEFAULT NULL,  -- 角色渲染缩放
+  collision_radius               FLOAT DEFAULT NULL,  -- 单位移动碰撞体半径
+  member_collision_radius        FLOAT DEFAULT NULL,  -- 单名队员的圆形判定体半径
+  formation_side                 FLOAT DEFAULT NULL,  -- 三角阵型边长
+  red_zone_clearance             FLOAT DEFAULT NULL,  -- 与红色屏蔽区边缘保持的安全距离
+  member_separation              FLOAT DEFAULT NULL,  -- 队员之间的最小间距
+  member_enemy_separation        FLOAT DEFAULT NULL,  -- 队员与敌方单位之间的隔离距离
+  regen_delay                    INT DEFAULT NULL,  -- 距上次受击多久开始回血（毫秒）
+  regen_per_second               FLOAT DEFAULT NULL,  -- 每秒恢复的最大生命值比例
+  detonate_delay                 INT DEFAULT NULL,  -- 血条耗尽到自爆/引爆的延迟（毫秒）
+  detonate_radius                FLOAT DEFAULT NULL,  -- 自爆半径（像素）
+  detonate_damage                FLOAT DEFAULT NULL,  -- 爆心伤害
+  detonate_damage_falloff        FLOAT DEFAULT NULL,  -- 每档伤害递减比例
+  detonate_falloff_step          FLOAT DEFAULT NULL,  -- 伤害递减档距（像素）
+  charge_speed                   FLOAT DEFAULT NULL,  -- 阵亡冲锋速度（像素/秒）
+  charge_trigger_distance        FLOAT DEFAULT NULL,  -- 贴上该距离立即自爆（像素）
+  charge_stun_duration           INT DEFAULT NULL,  -- 冲刺近战命中后目标小队陷入待机的时长（毫秒；Guard/Aegis = 1000，Smasher/Kratos = 3000）；>0 = 启用冲刺近战；留空 = 无冲刺
+  death_tint_duration            INT DEFAULT NULL,  -- 阵亡泛红时长（毫秒）
+  death_tint_strength            FLOAT DEFAULT NULL,  -- 阵亡泛红强度
+  track_range                    FLOAT DEFAULT NULL,  -- 追踪范围（敌方 AI，像素）
+  attack_release_margin          FLOAT DEFAULT NULL,  -- 停火迟滞带（像素）
+  track_release_margin           FLOAT DEFAULT NULL,  -- 放弃追踪迟滞带（像素）
+  -- ---- 部署扣点（经济）----
+  deploy_cost                    INT DEFAULT NULL,  -- 驻场削点：场上每存在一个该兵种，每分钟可获得的点数上限减少该值（不直接扣当前点数）
+  -- ---- 队员隔离与归队（我方）----
+  member_separation_max_push     FLOAT DEFAULT NULL,  -- 队员隔离每帧最大推挤位移（像素）
+  member_anim_max_step           FLOAT DEFAULT NULL,  -- 队员渲染位置每帧最大位移（像素）
+  member_return_distance         FLOAT DEFAULT NULL,  -- 掉队判定距离（像素）
+  member_return_exit_ratio       FLOAT DEFAULT NULL,  -- 归队迟滞比例：收进「判定距离 × 该比例」以内才算归位
+  member_return_extra_clearance  FLOAT DEFAULT NULL,  -- 归位通道净空额外量（像素），最终净空 = red_zone_clearance + 该值
+  member_return_speed            FLOAT DEFAULT NULL,  -- 归队移动速度（像素/秒）
+  member_return_replan_distance  FLOAT DEFAULT NULL,  -- 归队路径的重新规划距离阈值（像素）
+  member_return_waypoint_radius  FLOAT DEFAULT NULL,  -- 归队路径拐点的到达判定距离（像素）
+  -- ---- 阵型与收拢（我方）----
+  squad_regroup_arrive           FLOAT DEFAULT NULL,  -- 归位判定距离（像素）
+  squad_regroup_catchup_distance FLOAT DEFAULT NULL,  -- 落后该距离后开始提速归队（像素）
+  squad_regroup_stall_ratio      FLOAT DEFAULT NULL,  -- 单帧靠近量不足预算的该比例即累计卡滞
+  squad_regroup_stall_frames     INT DEFAULT NULL,  -- 连续卡滞帧数达到该值即视为已归位
+  squad_free_return_ratio        FLOAT DEFAULT NULL,  -- 超出自由散开范围后的回收速度倍率（相对行军速度）
+  squad_separation_target        FLOAT DEFAULT NULL,  -- 队形被挤压时的兜底隔离距离（像素）
+  squad_separation_buffer        FLOAT DEFAULT NULL,  -- 队形隔离的收敛容差
+  squad_order_spread             FLOAT DEFAULT NULL,  -- 多队同时移动时终点圆环分摊半径（像素）：越小越贴近点击点，取值需保证相邻小队贴近而不相叠
+  squad_separation_passes        INT DEFAULT NULL,  -- 队员隔离与红区净空交替求解轮数
+  squad_edge_range               FLOAT DEFAULT NULL,  -- 判定「已贴到红色屏蔽区边缘」的额外距离（像素）
+  squad_edge_exit_range          FLOAT DEFAULT NULL,  -- 贴红区判定的退出迟滞距离（像素）
+  squad_formation_lerp           FLOAT DEFAULT NULL,  -- 行进方向插值系数（避免拐角处方向跳变）
+  squad_morph_duration           INT DEFAULT NULL,  -- 三角阵型与自由散开的过渡时长（毫秒）
+  squad_free_spread              FLOAT DEFAULT NULL,  -- 自由移动时的横向展开量（像素）
+  squad_free_max_distance        FLOAT DEFAULT NULL,  -- 队员与队形中心的最大距离（像素）
+  squad_free_back_left           FLOAT DEFAULT NULL,  -- 自由站位「左侧」沿行进方向的落后量（像素）
+  squad_free_back_apex           FLOAT DEFAULT NULL,  -- 自由站位「中间」沿行进方向的落后量（像素，负为更靠前）
+  squad_free_back_right          FLOAT DEFAULT NULL,  -- 自由站位「右侧」沿行进方向的落后量（像素）
+  squad_slot_swap_blend          FLOAT DEFAULT NULL,  -- 允许重新分配站位所需的散开完成度
+  -- ---- 动画（我方）----
+  attack_animation_name          VARCHAR(32) DEFAULT NULL,  -- 攻击动画名（默认 'attack'；TankM1 等美术攻击动作名不同的单位填 'skill1' 等）
+  animation_mix_attack           FLOAT DEFAULT NULL,  -- 攻击与移动/待机交叉淡化时长（秒）
+  animation_mix_loop             FLOAT DEFAULT NULL,  -- 移动与待机交叉淡化时长（秒）
+  attack_animation_fallback      INT DEFAULT NULL,  -- 取不到攻击动画时长时的兜底锁定时长（毫秒）
+  animation_lock_grace           FLOAT DEFAULT NULL,  -- 一次性动画尾帧保留容差（毫秒）
+  spawn_animation_duration       INT DEFAULT NULL,  -- 出生动画时长（毫秒）
+  spawn_animation_min_scale      FLOAT DEFAULT NULL,  -- 出生动画起始缩放（相对正常体型）
+  -- ---- 红区绕行与移动容错（我方）----
+  red_route_range                FLOAT DEFAULT NULL,  -- 「移动路线范围内」的红区判定半径（像素）
+  red_steer_bias                 FLOAT DEFAULT NULL,  -- 沿红色屏蔽区行走时的额外外扩量（保证净空足额）
+  move_stall_timeout             INT DEFAULT NULL,  -- 贴着红区打转、长时间无法靠近终点的判定时长（毫秒）
+  move_progress_epsilon          FLOAT DEFAULT NULL,  -- 判定「确实靠近了终点」的最小距离（像素）
+  charge_retarget_interval       INT DEFAULT NULL,  -- 阵亡冲锋的重新索敌间隔（毫秒）
+  -- ---- 视觉尺寸 ----
+  bar_width                      FLOAT DEFAULT NULL,  -- 血条宽度（像素）
+  shadow_width_ratio             FLOAT DEFAULT NULL,  -- 脚下阴影宽度 / 单位显示宽度
+  shadow_flatten                 FLOAT DEFAULT NULL,  -- 脚下阴影高度 / 宽度
+  shadow_alpha                   FLOAT DEFAULT NULL,  -- 脚下阴影透明度
+  shadow_offset_y                FLOAT DEFAULT NULL,  -- 脚下阴影相对单位原点的纵向偏移（像素）
+  ring_width                     FLOAT DEFAULT NULL,  -- 脚下选中圆环宽度（像素）
+  ring_height                    FLOAT DEFAULT NULL,  -- 脚下选中圆环高度（像素）
+  ring_offset_y                  FLOAT DEFAULT NULL,  -- 脚下选中圆环纵向偏移（像素）
+  -- ---- 敌方 AI 与行动路线 ----
+  hold_duration                  INT DEFAULT NULL,  -- 行动点待机时长（毫秒）
+  patrol_radius                  FLOAT DEFAULT NULL,  -- 待机巡逻范围半径（像素）
+  patrol_min_radius              FLOAT DEFAULT NULL,  -- 巡逻折返的最小半径（像素）
+  patrol_slack                   FLOAT DEFAULT NULL,  -- 巡逻硬约束容差（像素）
+  endpoint_roam_radius           FLOAT DEFAULT NULL,  -- 路线终点自由待机区域半径（像素）
+  endpoint_idle_min              INT DEFAULT NULL,  -- 终点到位后随机静止时长下限（毫秒）
+  endpoint_idle_max              INT DEFAULT NULL,  -- 终点到位后随机静止时长上限（毫秒）
+  endpoint_return_slack_factor   FLOAT DEFAULT NULL,  -- 终点回位距离 = 待机半径 + patrol_slack × 该系数
+  route_corridor                 FLOAT DEFAULT NULL,  -- 移动路线走廊半宽（像素）
+  route_variant_count            INT DEFAULT NULL,  -- 每条主路线生成的随机变体数量
+  spawn_offmap_padding           FLOAT DEFAULT NULL,  -- 出生点在地图外额外补足的入场距离（像素）
+  separation_strength            FLOAT DEFAULT NULL,  -- 单位隔离每帧推开重叠量的比例
+  separation_max_push            FLOAT DEFAULT NULL,  -- 单位隔离每帧最大推挤位移（像素）
+  replan_cooldown                INT DEFAULT NULL,  -- 路径重规划冷却（毫秒）
+  stuck_time                     INT DEFAULT NULL,  -- 卡滞判定时长（毫秒）
+  stuck_distance                 FLOAT DEFAULT NULL,  -- 卡滞判定位移阈值（像素）
+  attack_contact_tolerance       FLOAT DEFAULT NULL,  -- 进入攻击范围的到位容差（像素）
+  attack_animation_loop          INT DEFAULT NULL,  -- 攻击姿态是否循环播放（1 = 循环）
+  knockback_distance             FLOAT DEFAULT NULL,  -- 被击中后的击退距离（像素）
+  knockback_duration             INT DEFAULT NULL,  -- 被击中后的击退持续时间（毫秒）
+  -- ---- 攻击弹丸与溅射（重装单位）----
+  attack_blast_radius            FLOAT DEFAULT NULL,  -- 攻击溅射半径（像素）：命中点周围该范围内的敌人全部受伤；NULL/0 = 单体攻击
+  attack_blast_falloff           FLOAT DEFAULT NULL,  -- 溅射伤害每档向外递减比例（0.2 = 每档降 20%）
+  attack_blast_falloff_step      FLOAT DEFAULT NULL,  -- 溅射伤害递减档距（像素）
+  attack_projectile_size         FLOAT DEFAULT NULL,  -- 攻击弹丸显示尺寸（像素）：NULL = 无弹丸表现（瞬时命中）
+  attack_while_moving            INT DEFAULT NULL,  -- 移动开火：1 = 行进中也能自动开火（NULL/0 = 只有站定才能开火）
+  attack_while_moving_arc        FLOAT DEFAULT NULL,  -- 移动开火的正面射界半角（度）：只锁定行进方向该角度内的敌人；NULL/<=0 = 不限方向
+  attack_facing_required         INT DEFAULT NULL,  -- 面向判定：1 = 只能面向敌方单位时才能攻击（不面向时先自动转身，并等一个攻击间隔再打）；NULL/0 = 不判定朝向
+  -- ---- 攻击弹丸表现（重装单位）----
+  attack_projectile_speed        FLOAT DEFAULT NULL,  -- 弹丸飞行速度（像素/秒）
+  attack_projectile_launch_ratio FLOAT DEFAULT NULL,  -- 出膛时刻占攻击动画时长的比例（0.5 = 动画播到一半出膛，1 = 播完出膛）
+  attack_projectile_bone         VARCHAR(32) DEFAULT NULL,  -- 出膛点所在的骨骼名（TankM1 / Warjack = muzzle、Ares = muzzle1,muzzle2，多骨骼取距目标最近者）；NULL = 无骨骼，改用下面的兜底偏移估算
+  attack_projectile_muzzle_forward FLOAT DEFAULT NULL,  -- 兜底出膛点：沿射向自单位锚点前移（像素）
+  attack_projectile_muzzle_height FLOAT DEFAULT NULL,  -- 兜底出膛点：自单位锚点上移（像素）
+  -- ---- 多部件外观（Warjack）----
+  render_parts                   VARCHAR(255) DEFAULT NULL,  -- 多部件外观：资源键按「从后到前」排列、逗号分隔，最后一个是主体（血条/炮口/染色都取它）；留空 = 单部件
+  -- ---- 阵亡自爆表现（Ares）----
+  death_charge_animation         VARCHAR(32) DEFAULT NULL,  -- 阵亡冲锋中途切换到的动作名（Ares = skill3）；留空 = 全程用冲锋动作
+  death_charge_animation_delay   INT DEFAULT NULL,  -- 进入自爆状态后多少毫秒切到上面的动作（Ares = 0，一进入自爆状态就直接播 skill3 第一秒）
+  -- ---- 近战（Warjack）----
+  melee_range                    FLOAT DEFAULT NULL,  -- 近战触发距离：自身碰撞体之外再多该距离内有敌人就打近战；留空 = 没有近战
+  melee_animation_name           VARCHAR(32) DEFAULT NULL,  -- 近战动作名（Warjack = attack_SP）
+  melee_ignore_armor             INT DEFAULT NULL,  -- 近战是否无视护甲（1 = 无视，按防守方护甲为 0 结算）
+  -- ---- 外观朝向（Ares）----
+  art_facing_left                INT DEFAULT NULL,  -- 素材本身朝向：1 = 原图朝左（渲染朝向与其它单位相反，Ares）；留空 = 原图朝右
+  -- ---- 开局召唤分身（SF / Agent）----
+  summon_animation_name          VARCHAR(32) DEFAULT NULL,  -- 开局召唤动画（SF = skill2，本体播放）；留空 = 无召唤
+  summon_clone_count             INT DEFAULT NULL,  -- 开局召唤的分身数量（SF = 2，分身数值与机制完全继承本体）；留空 = 不召唤
+  summon_clone_delay             INT DEFAULT NULL   -- 召唤动画播到多少毫秒时分身落地（SF = 1400，skill2 全长 2833ms 的中段）
+);
+
+DROP TABLE IF EXISTS player_merc;
+CREATE TABLE player_merc (  -- inf_temp（战场雇佣 / 战场支援单位）
+  unit_id                        VARCHAR(32) NOT NULL PRIMARY KEY,  -- 单位唯一标识
+  unit_name                      VARCHAR(32) DEFAULT NULL,  -- 显示名
+  cost                           INT NOT NULL DEFAULT 0,  -- 招募消耗：出兵时从可用点数中一次性扣除的点数
+  build_time                     FLOAT NOT NULL DEFAULT 0,  -- 训练耗时（秒）
+  max_hp                         INT NOT NULL DEFAULT 1,  -- 最大生命值
+  armor                          INT NOT NULL DEFAULT 0,  -- 固定减伤护甲
+  move_speed                     FLOAT NOT NULL DEFAULT 0,  -- 移动速度（像素/秒）
+  action_range                   FLOAT NOT NULL DEFAULT 0,  -- 攻击/作用距离（像素）
+  action_value                   INT NOT NULL DEFAULT 0,  -- 作用数值（正为伤害/治疗）
+  action_cd                      FLOAT NOT NULL DEFAULT 0,  -- 技能冷却/攻击间隔（秒）
+  target_type                    INT NOT NULL DEFAULT 0 CHECK (target_type IN (0, 1)),  -- 作用目标判定：0 = 敌方单位，1 = 我方单位（支援单位对我方回血用）
+  armor_penetration              INT NOT NULL DEFAULT 0,  -- 破甲值：对拥有护甲的敌人能减去的护甲值
+  -- ---- 以下为代码内使用的静态数值（自定字段名与类型）----
+  squad_size                     INT DEFAULT 1,  -- 编队人数：多人独立碰撞体、合并为一个基本单位
+  squad_cap                      INT DEFAULT 1,  -- 该兵种可同时出场的单位数量上限（含训练中）
+  roster                         VARCHAR(128) DEFAULT NULL,  -- 编队花名册（逗号分隔；最后一项为队长）
+  character_scale                FLOAT DEFAULT NULL,  -- 角色渲染缩放
+  collision_radius               FLOAT DEFAULT NULL,  -- 单位移动碰撞体半径
+  member_collision_radius        FLOAT DEFAULT NULL,  -- 单名队员的圆形判定体半径
+  formation_side                 FLOAT DEFAULT NULL,  -- 三角阵型边长
+  red_zone_clearance             FLOAT DEFAULT NULL,  -- 与红色屏蔽区边缘保持的安全距离
+  member_separation              FLOAT DEFAULT NULL,  -- 队员之间的最小间距
+  member_enemy_separation        FLOAT DEFAULT NULL,  -- 队员与敌方单位之间的隔离距离
+  regen_delay                    INT DEFAULT NULL,  -- 距上次受击多久开始回血（毫秒）
+  regen_per_second               FLOAT DEFAULT NULL,  -- 每秒恢复的最大生命值比例
+  detonate_delay                 INT DEFAULT NULL,  -- 血条耗尽到自爆/引爆的延迟（毫秒）
+  detonate_radius                FLOAT DEFAULT NULL,  -- 自爆半径（像素）
+  detonate_damage                FLOAT DEFAULT NULL,  -- 爆心伤害
+  detonate_damage_falloff        FLOAT DEFAULT NULL,  -- 每档伤害递减比例
+  detonate_falloff_step          FLOAT DEFAULT NULL,  -- 伤害递减档距（像素）
+  charge_speed                   FLOAT DEFAULT NULL,  -- 阵亡冲锋速度（像素/秒）
+  charge_trigger_distance        FLOAT DEFAULT NULL,  -- 贴上该距离立即自爆（像素）
+  charge_stun_duration           INT DEFAULT NULL,  -- 冲刺近战命中后目标小队陷入待机的时长（毫秒；Guard/Aegis = 1000，Smasher/Kratos = 3000）；>0 = 启用冲刺近战；留空 = 无冲刺
+  death_tint_duration            INT DEFAULT NULL,  -- 阵亡泛红时长（毫秒）
+  death_tint_strength            FLOAT DEFAULT NULL,  -- 阵亡泛红强度
+  track_range                    FLOAT DEFAULT NULL,  -- 追踪范围（敌方 AI，像素）
+  attack_release_margin          FLOAT DEFAULT NULL,  -- 停火迟滞带（像素）
+  track_release_margin           FLOAT DEFAULT NULL,  -- 放弃追踪迟滞带（像素）
+  -- ---- 部署扣点（经济）----
+  deploy_cost                    INT DEFAULT NULL,  -- 驻场削点：场上每存在一个该兵种，每分钟可获得的点数上限减少该值（不直接扣当前点数）
+  -- ---- 队员隔离与归队（我方）----
+  member_separation_max_push     FLOAT DEFAULT NULL,  -- 队员隔离每帧最大推挤位移（像素）
+  member_anim_max_step           FLOAT DEFAULT NULL,  -- 队员渲染位置每帧最大位移（像素）
+  member_return_distance         FLOAT DEFAULT NULL,  -- 掉队判定距离（像素）
+  member_return_exit_ratio       FLOAT DEFAULT NULL,  -- 归队迟滞比例：收进「判定距离 × 该比例」以内才算归位
+  member_return_extra_clearance  FLOAT DEFAULT NULL,  -- 归位通道净空额外量（像素），最终净空 = red_zone_clearance + 该值
+  member_return_speed            FLOAT DEFAULT NULL,  -- 归队移动速度（像素/秒）
+  member_return_replan_distance  FLOAT DEFAULT NULL,  -- 归队路径的重新规划距离阈值（像素）
+  member_return_waypoint_radius  FLOAT DEFAULT NULL,  -- 归队路径拐点的到达判定距离（像素）
+  -- ---- 阵型与收拢（我方）----
+  squad_regroup_arrive           FLOAT DEFAULT NULL,  -- 归位判定距离（像素）
+  squad_regroup_catchup_distance FLOAT DEFAULT NULL,  -- 落后该距离后开始提速归队（像素）
+  squad_regroup_stall_ratio      FLOAT DEFAULT NULL,  -- 单帧靠近量不足预算的该比例即累计卡滞
+  squad_regroup_stall_frames     INT DEFAULT NULL,  -- 连续卡滞帧数达到该值即视为已归位
+  squad_free_return_ratio        FLOAT DEFAULT NULL,  -- 超出自由散开范围后的回收速度倍率（相对行军速度）
+  squad_separation_target        FLOAT DEFAULT NULL,  -- 队形被挤压时的兜底隔离距离（像素）
+  squad_separation_buffer        FLOAT DEFAULT NULL,  -- 队形隔离的收敛容差
+  squad_order_spread             FLOAT DEFAULT NULL,  -- 多队同时移动时终点圆环分摊半径（像素）：越小越贴近点击点，取值需保证相邻小队贴近而不相叠
+  squad_separation_passes        INT DEFAULT NULL,  -- 队员隔离与红区净空交替求解轮数
+  squad_edge_range               FLOAT DEFAULT NULL,  -- 判定「已贴到红色屏蔽区边缘」的额外距离（像素）
+  squad_edge_exit_range          FLOAT DEFAULT NULL,  -- 贴红区判定的退出迟滞距离（像素）
+  squad_formation_lerp           FLOAT DEFAULT NULL,  -- 行进方向插值系数（避免拐角处方向跳变）
+  squad_morph_duration           INT DEFAULT NULL,  -- 三角阵型与自由散开的过渡时长（毫秒）
+  squad_free_spread              FLOAT DEFAULT NULL,  -- 自由移动时的横向展开量（像素）
+  squad_free_max_distance        FLOAT DEFAULT NULL,  -- 队员与队形中心的最大距离（像素）
+  squad_free_back_left           FLOAT DEFAULT NULL,  -- 自由站位「左侧」沿行进方向的落后量（像素）
+  squad_free_back_apex           FLOAT DEFAULT NULL,  -- 自由站位「中间」沿行进方向的落后量（像素，负为更靠前）
+  squad_free_back_right          FLOAT DEFAULT NULL,  -- 自由站位「右侧」沿行进方向的落后量（像素）
+  squad_slot_swap_blend          FLOAT DEFAULT NULL,  -- 允许重新分配站位所需的散开完成度
+  -- ---- 动画（我方）----
+  attack_animation_name          VARCHAR(32) DEFAULT NULL,  -- 攻击动画名（默认 'attack'；TankM1 等美术攻击动作名不同的单位填 'skill1' 等）
+  animation_mix_attack           FLOAT DEFAULT NULL,  -- 攻击与移动/待机交叉淡化时长（秒）
+  animation_mix_loop             FLOAT DEFAULT NULL,  -- 移动与待机交叉淡化时长（秒）
+  attack_animation_fallback      INT DEFAULT NULL,  -- 取不到攻击动画时长时的兜底锁定时长（毫秒）
+  animation_lock_grace           FLOAT DEFAULT NULL,  -- 一次性动画尾帧保留容差（毫秒）
+  spawn_animation_duration       INT DEFAULT NULL,  -- 出生动画时长（毫秒）
+  spawn_animation_min_scale      FLOAT DEFAULT NULL,  -- 出生动画起始缩放（相对正常体型）
+  -- ---- 红区绕行与移动容错（我方）----
+  red_route_range                FLOAT DEFAULT NULL,  -- 「移动路线范围内」的红区判定半径（像素）
+  red_steer_bias                 FLOAT DEFAULT NULL,  -- 沿红色屏蔽区行走时的额外外扩量（保证净空足额）
+  move_stall_timeout             INT DEFAULT NULL,  -- 贴着红区打转、长时间无法靠近终点的判定时长（毫秒）
+  move_progress_epsilon          FLOAT DEFAULT NULL,  -- 判定「确实靠近了终点」的最小距离（像素）
+  charge_retarget_interval       INT DEFAULT NULL,  -- 阵亡冲锋的重新索敌间隔（毫秒）
+  -- ---- 视觉尺寸 ----
+  bar_width                      FLOAT DEFAULT NULL,  -- 血条宽度（像素）
+  shadow_width_ratio             FLOAT DEFAULT NULL,  -- 脚下阴影宽度 / 单位显示宽度
+  shadow_flatten                 FLOAT DEFAULT NULL,  -- 脚下阴影高度 / 宽度
+  shadow_alpha                   FLOAT DEFAULT NULL,  -- 脚下阴影透明度
+  shadow_offset_y                FLOAT DEFAULT NULL,  -- 脚下阴影相对单位原点的纵向偏移（像素）
+  ring_width                     FLOAT DEFAULT NULL,  -- 脚下选中圆环宽度（像素）
+  ring_height                    FLOAT DEFAULT NULL,  -- 脚下选中圆环高度（像素）
+  ring_offset_y                  FLOAT DEFAULT NULL,  -- 脚下选中圆环纵向偏移（像素）
+  -- ---- 敌方 AI 与行动路线 ----
+  hold_duration                  INT DEFAULT NULL,  -- 行动点待机时长（毫秒）
+  patrol_radius                  FLOAT DEFAULT NULL,  -- 待机巡逻范围半径（像素）
+  patrol_min_radius              FLOAT DEFAULT NULL,  -- 巡逻折返的最小半径（像素）
+  patrol_slack                   FLOAT DEFAULT NULL,  -- 巡逻硬约束容差（像素）
+  endpoint_roam_radius           FLOAT DEFAULT NULL,  -- 路线终点自由待机区域半径（像素）
+  endpoint_idle_min              INT DEFAULT NULL,  -- 终点到位后随机静止时长下限（毫秒）
+  endpoint_idle_max              INT DEFAULT NULL,  -- 终点到位后随机静止时长上限（毫秒）
+  endpoint_return_slack_factor   FLOAT DEFAULT NULL,  -- 终点回位距离 = 待机半径 + patrol_slack × 该系数
+  route_corridor                 FLOAT DEFAULT NULL,  -- 移动路线走廊半宽（像素）
+  route_variant_count            INT DEFAULT NULL,  -- 每条主路线生成的随机变体数量
+  spawn_offmap_padding           FLOAT DEFAULT NULL,  -- 出生点在地图外额外补足的入场距离（像素）
+  separation_strength            FLOAT DEFAULT NULL,  -- 单位隔离每帧推开重叠量的比例
+  separation_max_push            FLOAT DEFAULT NULL,  -- 单位隔离每帧最大推挤位移（像素）
+  replan_cooldown                INT DEFAULT NULL,  -- 路径重规划冷却（毫秒）
+  stuck_time                     INT DEFAULT NULL,  -- 卡滞判定时长（毫秒）
+  stuck_distance                 FLOAT DEFAULT NULL,  -- 卡滞判定位移阈值（像素）
+  attack_contact_tolerance       FLOAT DEFAULT NULL,  -- 进入攻击范围的到位容差（像素）
+  attack_animation_loop          INT DEFAULT NULL,  -- 攻击姿态是否循环播放（1 = 循环）
+  knockback_distance             FLOAT DEFAULT NULL,  -- 被击中后的击退距离（像素）
+  knockback_duration             INT DEFAULT NULL,  -- 被击中后的击退持续时间（毫秒）
+  -- ---- 攻击弹丸与溅射（重装单位）----
+  attack_blast_radius            FLOAT DEFAULT NULL,  -- 攻击溅射半径（像素）：命中点周围该范围内的敌人全部受伤；NULL/0 = 单体攻击
+  attack_blast_falloff           FLOAT DEFAULT NULL,  -- 溅射伤害每档向外递减比例（0.2 = 每档降 20%）
+  attack_blast_falloff_step      FLOAT DEFAULT NULL,  -- 溅射伤害递减档距（像素）
+  attack_projectile_size         FLOAT DEFAULT NULL,  -- 攻击弹丸显示尺寸（像素）：NULL = 无弹丸表现（瞬时命中）
+  attack_while_moving            INT DEFAULT NULL,  -- 移动开火：1 = 行进中也能自动开火（NULL/0 = 只有站定才能开火）
+  attack_while_moving_arc        FLOAT DEFAULT NULL,  -- 移动开火的正面射界半角（度）：只锁定行进方向该角度内的敌人；NULL/<=0 = 不限方向
+  attack_facing_required         INT DEFAULT NULL,  -- 面向判定：1 = 只能面向敌方单位时才能攻击（不面向时先自动转身，并等一个攻击间隔再打）；NULL/0 = 不判定朝向
+  -- ---- 攻击弹丸表现（重装单位）----
+  attack_projectile_speed        FLOAT DEFAULT NULL,  -- 弹丸飞行速度（像素/秒）
+  attack_projectile_launch_ratio FLOAT DEFAULT NULL,  -- 出膛时刻占攻击动画时长的比例（0.5 = 动画播到一半出膛，1 = 播完出膛）
+  attack_projectile_bone         VARCHAR(32) DEFAULT NULL,  -- 出膛点所在的骨骼名（TankM1 / Warjack = muzzle、Ares = muzzle1,muzzle2，多骨骼取距目标最近者）；NULL = 无骨骼，改用下面的兜底偏移估算
+  attack_projectile_muzzle_forward FLOAT DEFAULT NULL,  -- 兜底出膛点：沿射向自单位锚点前移（像素）
+  attack_projectile_muzzle_height FLOAT DEFAULT NULL,  -- 兜底出膛点：自单位锚点上移（像素）
+  -- ---- 多部件外观（Warjack）----
+  render_parts                   VARCHAR(255) DEFAULT NULL,  -- 多部件外观：资源键按「从后到前」排列、逗号分隔，最后一个是主体（血条/炮口/染色都取它）；留空 = 单部件
+  -- ---- 阵亡自爆表现（Ares）----
+  death_charge_animation         VARCHAR(32) DEFAULT NULL,  -- 阵亡冲锋中途切换到的动作名（Ares = skill3）；留空 = 全程用冲锋动作
+  death_charge_animation_delay   INT DEFAULT NULL,  -- 进入自爆状态后多少毫秒切到上面的动作（Ares = 0，一进入自爆状态就直接播 skill3 第一秒）
+  -- ---- 近战（Warjack）----
+  melee_range                    FLOAT DEFAULT NULL,  -- 近战触发距离：自身碰撞体之外再多该距离内有敌人就打近战；留空 = 没有近战
+  melee_animation_name           VARCHAR(32) DEFAULT NULL,  -- 近战动作名（Warjack = attack_SP）
+  melee_ignore_armor             INT DEFAULT NULL,  -- 近战是否无视护甲（1 = 无视，按防守方护甲为 0 结算）
+  -- ---- 外观朝向（Ares）----
+  art_facing_left                INT DEFAULT NULL,  -- 素材本身朝向：1 = 原图朝左（渲染朝向与其它单位相反，Ares）；留空 = 原图朝右
+  -- ---- 开局召唤分身（SF / Agent）----
+  summon_animation_name          VARCHAR(32) DEFAULT NULL,  -- 开局召唤动画（SF = skill2，本体播放）；留空 = 无召唤
+  summon_clone_count             INT DEFAULT NULL,  -- 开局召唤的分身数量（SF = 2，分身数值与机制完全继承本体）；留空 = 不召唤
+  summon_clone_delay             INT DEFAULT NULL   -- 召唤动画播到多少毫秒时分身落地（SF = 1400，skill2 全长 2833ms 的中段）
+);
+
+DROP TABLE IF EXISTS enemy_infantry;
+CREATE TABLE enemy_infantry (  -- Vespid（现役单位）
+  unit_id                        VARCHAR(32) NOT NULL PRIMARY KEY,  -- 单位唯一标识
+  unit_name                      VARCHAR(32) DEFAULT NULL,  -- 显示名
+  cost                           INT NOT NULL DEFAULT 0,  -- 招募消耗：出兵时从可用点数中一次性扣除的点数
+  build_time                     FLOAT NOT NULL DEFAULT 0,  -- 训练耗时（秒）
+  max_hp                         INT NOT NULL DEFAULT 1,  -- 最大生命值
+  armor                          INT NOT NULL DEFAULT 0,  -- 固定减伤护甲
+  move_speed                     FLOAT NOT NULL DEFAULT 0,  -- 移动速度（像素/秒）
+  action_range                   FLOAT NOT NULL DEFAULT 0,  -- 攻击/作用距离（像素）
+  action_value                   INT NOT NULL DEFAULT 0,  -- 作用数值（正为伤害/治疗）
+  action_cd                      FLOAT NOT NULL DEFAULT 0,  -- 技能冷却/攻击间隔（秒）
+  target_type                    INT NOT NULL DEFAULT 0 CHECK (target_type IN (0, 1)),  -- 作用目标判定：0 = 敌方单位，1 = 我方单位（支援单位对我方回血用）
+  armor_penetration              INT NOT NULL DEFAULT 0,  -- 破甲值：对拥有护甲的敌人能减去的护甲值
+  -- ---- 以下为代码内使用的静态数值（自定字段名与类型）----
+  squad_size                     INT DEFAULT 1,  -- 编队人数：多人独立碰撞体、合并为一个基本单位
+  squad_cap                      INT DEFAULT 1,  -- 该兵种可同时出场的单位数量上限（含训练中）
+
+  roster                         VARCHAR(128) DEFAULT NULL,  -- 编队花名册（逗号分隔；最后一项为队长）
+  character_scale                FLOAT DEFAULT NULL,  -- 角色渲染缩放
+  collision_radius               FLOAT DEFAULT NULL,  -- 单位移动碰撞体半径
+  member_collision_radius        FLOAT DEFAULT NULL,  -- 单名队员的圆形判定体半径
+  formation_side                 FLOAT DEFAULT NULL,  -- 三角阵型边长
+  red_zone_clearance             FLOAT DEFAULT NULL,  -- 与红色屏蔽区边缘保持的安全距离
+  member_separation              FLOAT DEFAULT NULL,  -- 队员之间的最小间距
+  member_enemy_separation        FLOAT DEFAULT NULL,  -- 队员与敌方单位之间的隔离距离
+  regen_delay                    INT DEFAULT NULL,  -- 距上次受击多久开始回血（毫秒）
+  regen_per_second               FLOAT DEFAULT NULL,  -- 每秒恢复的最大生命值比例
+  detonate_delay                 INT DEFAULT NULL,  -- 血条耗尽到自爆/引爆的延迟（毫秒）
+  detonate_radius                FLOAT DEFAULT NULL,  -- 自爆半径（像素）
+  detonate_damage                FLOAT DEFAULT NULL,  -- 爆心伤害
+  detonate_damage_falloff        FLOAT DEFAULT NULL,  -- 每档伤害递减比例
+  detonate_falloff_step          FLOAT DEFAULT NULL,  -- 伤害递减档距（像素）
+  charge_speed                   FLOAT DEFAULT NULL,  -- 阵亡冲锋速度（像素/秒）
+  charge_trigger_distance        FLOAT DEFAULT NULL,  -- 贴上该距离立即自爆（像素）
+  charge_stun_duration           INT DEFAULT NULL,  -- 冲刺近战命中后目标小队陷入待机的时长（毫秒；Guard/Aegis = 1000，Smasher/Kratos = 3000）；>0 = 启用冲刺近战；留空 = 无冲刺
+  death_tint_duration            INT DEFAULT NULL,  -- 阵亡泛红时长（毫秒）
+  death_tint_strength            FLOAT DEFAULT NULL,  -- 阵亡泛红强度
+  track_range                    FLOAT DEFAULT NULL,  -- 追踪范围（敌方 AI，像素）
+  attack_release_margin          FLOAT DEFAULT NULL,  -- 停火迟滞带（像素）
+  track_release_margin           FLOAT DEFAULT NULL,  -- 放弃追踪迟滞带（像素）
+  -- ---- 部署扣点（经济）----
+  deploy_cost                    INT DEFAULT NULL,  -- 驻场削点：场上每存在一个该兵种，每分钟可获得的点数上限减少该值（不直接扣当前点数）
+  -- ---- 队员隔离与归队（我方）----
+  member_separation_max_push     FLOAT DEFAULT NULL,  -- 队员隔离每帧最大推挤位移（像素）
+  member_anim_max_step           FLOAT DEFAULT NULL,  -- 队员渲染位置每帧最大位移（像素）
+  member_return_distance         FLOAT DEFAULT NULL,  -- 掉队判定距离（像素）
+  member_return_exit_ratio       FLOAT DEFAULT NULL,  -- 归队迟滞比例：收进「判定距离 × 该比例」以内才算归位
+  member_return_extra_clearance  FLOAT DEFAULT NULL,  -- 归位通道净空额外量（像素），最终净空 = red_zone_clearance + 该值
+  member_return_speed            FLOAT DEFAULT NULL,  -- 归队移动速度（像素/秒）
+  member_return_replan_distance  FLOAT DEFAULT NULL,  -- 归队路径的重新规划距离阈值（像素）
+  member_return_waypoint_radius  FLOAT DEFAULT NULL,  -- 归队路径拐点的到达判定距离（像素）
+  -- ---- 阵型与收拢（我方）----
+  squad_regroup_arrive           FLOAT DEFAULT NULL,  -- 归位判定距离（像素）
+  squad_regroup_catchup_distance FLOAT DEFAULT NULL,  -- 落后该距离后开始提速归队（像素）
+  squad_regroup_stall_ratio      FLOAT DEFAULT NULL,  -- 单帧靠近量不足预算的该比例即累计卡滞
+  squad_regroup_stall_frames     INT DEFAULT NULL,  -- 连续卡滞帧数达到该值即视为已归位
+  squad_free_return_ratio        FLOAT DEFAULT NULL,  -- 超出自由散开范围后的回收速度倍率（相对行军速度）
+  squad_separation_target        FLOAT DEFAULT NULL,  -- 队形被挤压时的兜底隔离距离（像素）
+  squad_separation_buffer        FLOAT DEFAULT NULL,  -- 队形隔离的收敛容差
+  squad_order_spread             FLOAT DEFAULT NULL,  -- 多队同时移动时终点圆环分摊半径（像素）：越小越贴近点击点，取值需保证相邻小队贴近而不相叠
+  squad_separation_passes        INT DEFAULT NULL,  -- 队员隔离与红区净空交替求解轮数
+  squad_edge_range               FLOAT DEFAULT NULL,  -- 判定「已贴到红色屏蔽区边缘」的额外距离（像素）
+  squad_edge_exit_range          FLOAT DEFAULT NULL,  -- 贴红区判定的退出迟滞距离（像素）
+  squad_formation_lerp           FLOAT DEFAULT NULL,  -- 行进方向插值系数（避免拐角处方向跳变）
+  squad_morph_duration           INT DEFAULT NULL,  -- 三角阵型与自由散开的过渡时长（毫秒）
+  squad_free_spread              FLOAT DEFAULT NULL,  -- 自由移动时的横向展开量（像素）
+  squad_free_max_distance        FLOAT DEFAULT NULL,  -- 队员与队形中心的最大距离（像素）
+  squad_free_back_left           FLOAT DEFAULT NULL,  -- 自由站位「左侧」沿行进方向的落后量（像素）
+  squad_free_back_apex           FLOAT DEFAULT NULL,  -- 自由站位「中间」沿行进方向的落后量（像素，负为更靠前）
+  squad_free_back_right          FLOAT DEFAULT NULL,  -- 自由站位「右侧」沿行进方向的落后量（像素）
+  squad_slot_swap_blend          FLOAT DEFAULT NULL,  -- 允许重新分配站位所需的散开完成度
+  -- ---- 动画（我方）----
+  attack_animation_name          VARCHAR(32) DEFAULT NULL,  -- 攻击动画名（默认 'attack'；TankM1 等美术攻击动作名不同的单位填 'skill1' 等）
+  animation_mix_attack           FLOAT DEFAULT NULL,  -- 攻击与移动/待机交叉淡化时长（秒）
+  animation_mix_loop             FLOAT DEFAULT NULL,  -- 移动与待机交叉淡化时长（秒）
+  attack_animation_fallback      INT DEFAULT NULL,  -- 取不到攻击动画时长时的兜底锁定时长（毫秒）
+  animation_lock_grace           FLOAT DEFAULT NULL,  -- 一次性动画尾帧保留容差（毫秒）
+  spawn_animation_duration       INT DEFAULT NULL,  -- 出生动画时长（毫秒）
+  spawn_animation_min_scale      FLOAT DEFAULT NULL,  -- 出生动画起始缩放（相对正常体型）
+  -- ---- 红区绕行与移动容错（我方）----
+  red_route_range                FLOAT DEFAULT NULL,  -- 「移动路线范围内」的红区判定半径（像素）
+  red_steer_bias                 FLOAT DEFAULT NULL,  -- 沿红色屏蔽区行走时的额外外扩量（保证净空足额）
+  move_stall_timeout             INT DEFAULT NULL,  -- 贴着红区打转、长时间无法靠近终点的判定时长（毫秒）
+  move_progress_epsilon          FLOAT DEFAULT NULL,  -- 判定「确实靠近了终点」的最小距离（像素）
+  charge_retarget_interval       INT DEFAULT NULL,  -- 阵亡冲锋的重新索敌间隔（毫秒）
+  -- ---- 视觉尺寸 ----
+  bar_width                      FLOAT DEFAULT NULL,  -- 血条宽度（像素）
+  shadow_width_ratio             FLOAT DEFAULT NULL,  -- 脚下阴影宽度 / 单位显示宽度
+  shadow_flatten                 FLOAT DEFAULT NULL,  -- 脚下阴影高度 / 宽度
+  shadow_alpha                   FLOAT DEFAULT NULL,  -- 脚下阴影透明度
+  shadow_offset_y                FLOAT DEFAULT NULL,  -- 脚下阴影相对单位原点的纵向偏移（像素）
+  ring_width                     FLOAT DEFAULT NULL,  -- 脚下选中圆环宽度（像素）
+  ring_height                    FLOAT DEFAULT NULL,  -- 脚下选中圆环高度（像素）
+  ring_offset_y                  FLOAT DEFAULT NULL,  -- 脚下选中圆环纵向偏移（像素）
+  -- ---- 敌方 AI 与行动路线 ----
+  hold_duration                  INT DEFAULT NULL,  -- 行动点待机时长（毫秒）
+  patrol_radius                  FLOAT DEFAULT NULL,  -- 待机巡逻范围半径（像素）
+  patrol_min_radius              FLOAT DEFAULT NULL,  -- 巡逻折返的最小半径（像素）
+  patrol_slack                   FLOAT DEFAULT NULL,  -- 巡逻硬约束容差（像素）
+  endpoint_roam_radius           FLOAT DEFAULT NULL,  -- 路线终点自由待机区域半径（像素）
+  endpoint_idle_min              INT DEFAULT NULL,  -- 终点到位后随机静止时长下限（毫秒）
+  endpoint_idle_max              INT DEFAULT NULL,  -- 终点到位后随机静止时长上限（毫秒）
+  endpoint_return_slack_factor   FLOAT DEFAULT NULL,  -- 终点回位距离 = 待机半径 + patrol_slack × 该系数
+  route_corridor                 FLOAT DEFAULT NULL,  -- 移动路线走廊半宽（像素）
+  route_variant_count            INT DEFAULT NULL,  -- 每条主路线生成的随机变体数量
+  spawn_offmap_padding           FLOAT DEFAULT NULL,  -- 出生点在地图外额外补足的入场距离（像素）
+  separation_strength            FLOAT DEFAULT NULL,  -- 单位隔离每帧推开重叠量的比例
+  separation_max_push            FLOAT DEFAULT NULL,  -- 单位隔离每帧最大推挤位移（像素）
+  replan_cooldown                INT DEFAULT NULL,  -- 路径重规划冷却（毫秒）
+  stuck_time                     INT DEFAULT NULL,  -- 卡滞判定时长（毫秒）
+  stuck_distance                 FLOAT DEFAULT NULL,  -- 卡滞判定位移阈值（像素）
+  attack_contact_tolerance       FLOAT DEFAULT NULL,  -- 进入攻击范围的到位容差（像素）
+  attack_animation_loop          INT DEFAULT NULL,  -- 攻击姿态是否循环播放（1 = 循环）
+  knockback_distance             FLOAT DEFAULT NULL,  -- 被击中后的击退距离（像素）
+  knockback_duration             INT DEFAULT NULL,  -- 被击中后的击退持续时间（毫秒）
+  -- ---- 攻击弹丸与溅射（重装单位）----
+  attack_blast_radius            FLOAT DEFAULT NULL,  -- 攻击溅射半径（像素）：命中点周围该范围内的敌人全部受伤；NULL/0 = 单体攻击
+  attack_blast_falloff           FLOAT DEFAULT NULL,  -- 溅射伤害每档向外递减比例（0.2 = 每档降 20%）
+  attack_blast_falloff_step      FLOAT DEFAULT NULL,  -- 溅射伤害递减档距（像素）
+  attack_projectile_size         FLOAT DEFAULT NULL,  -- 攻击弹丸显示尺寸（像素）：NULL = 无弹丸表现（瞬时命中）
+  attack_while_moving            INT DEFAULT NULL,  -- 移动开火：1 = 行进中也能自动开火（NULL/0 = 只有站定才能开火）
+  attack_while_moving_arc        FLOAT DEFAULT NULL,  -- 移动开火的正面射界半角（度）：只锁定行进方向该角度内的敌人；NULL/<=0 = 不限方向
+  attack_facing_required         INT DEFAULT NULL,  -- 面向判定：1 = 只能面向敌方单位时才能攻击（不面向时先自动转身，并等一个攻击间隔再打）；NULL/0 = 不判定朝向
+  -- ---- 攻击弹丸表现（重装单位）----
+  attack_projectile_speed        FLOAT DEFAULT NULL,  -- 弹丸飞行速度（像素/秒）
+  attack_projectile_launch_ratio FLOAT DEFAULT NULL,  -- 出膛时刻占攻击动画时长的比例（0.5 = 动画播到一半出膛，1 = 播完出膛）
+  attack_projectile_bone         VARCHAR(32) DEFAULT NULL,  -- 出膛点所在的骨骼名（TankM1 / Warjack = muzzle、Ares = muzzle1,muzzle2，多骨骼取距目标最近者）；NULL = 无骨骼，改用下面的兜底偏移估算
+  attack_projectile_muzzle_forward FLOAT DEFAULT NULL,  -- 兜底出膛点：沿射向自单位锚点前移（像素）
+  attack_projectile_muzzle_height FLOAT DEFAULT NULL,  -- 兜底出膛点：自单位锚点上移（像素）
+  -- ---- 多部件外观（Warjack）----
+  render_parts                   VARCHAR(255) DEFAULT NULL,  -- 多部件外观：资源键按「从后到前」排列、逗号分隔，最后一个是主体（血条/炮口/染色都取它）；留空 = 单部件
+  -- ---- 阵亡自爆表现（Ares）----
+  death_charge_animation         VARCHAR(32) DEFAULT NULL,  -- 阵亡冲锋中途切换到的动作名（Ares = skill3）；留空 = 全程用冲锋动作
+  death_charge_animation_delay   INT DEFAULT NULL,  -- 进入自爆状态后多少毫秒切到上面的动作（Ares = 0，一进入自爆状态就直接播 skill3 第一秒）
+  -- ---- 近战（Warjack）----
+  melee_range                    FLOAT DEFAULT NULL,  -- 近战触发距离：自身碰撞体之外再多该距离内有敌人就打近战；留空 = 没有近战
+  melee_animation_name           VARCHAR(32) DEFAULT NULL,  -- 近战动作名（Warjack = attack_SP）
+  melee_ignore_armor             INT DEFAULT NULL,  -- 近战是否无视护甲（1 = 无视，按防守方护甲为 0 结算）
+  -- ---- 外观朝向（Ares）----
+  art_facing_left                INT DEFAULT NULL,  -- 素材本身朝向：1 = 原图朝左（渲染朝向与其它单位相反，Ares）；留空 = 原图朝右
+  -- ---- 开局召唤分身（SF / Agent）----
+  summon_animation_name          VARCHAR(32) DEFAULT NULL,  -- 开局召唤动画（SF = skill2，本体播放）；留空 = 无召唤
+  summon_clone_count             INT DEFAULT NULL,  -- 开局召唤的分身数量（SF = 2，分身数值与机制完全继承本体）；留空 = 不召唤
+  summon_clone_delay             INT DEFAULT NULL   -- 召唤动画播到多少毫秒时分身落地（SF = 1400，skill2 全长 2833ms 的中段）
+);
+
+DROP TABLE IF EXISTS enemy_heavy;
+CREATE TABLE enemy_heavy (  -- 敌方重甲，id 待定
+  unit_id                        VARCHAR(32) NOT NULL PRIMARY KEY,  -- 单位唯一标识
+  unit_name                      VARCHAR(32) DEFAULT NULL,  -- 显示名
+  cost                           INT NOT NULL DEFAULT 0,  -- 招募消耗：出兵时从可用点数中一次性扣除的点数
+  build_time                     FLOAT NOT NULL DEFAULT 0,  -- 训练耗时（秒）
+  max_hp                         INT NOT NULL DEFAULT 1,  -- 最大生命值
+  armor                          INT NOT NULL DEFAULT 0,  -- 固定减伤护甲
+  move_speed                     FLOAT NOT NULL DEFAULT 0,  -- 移动速度（像素/秒）
+  action_range                   FLOAT NOT NULL DEFAULT 0,  -- 攻击/作用距离（像素）
+  action_value                   INT NOT NULL DEFAULT 0,  -- 作用数值（正为伤害/治疗）
+  action_cd                      FLOAT NOT NULL DEFAULT 0,  -- 技能冷却/攻击间隔（秒）
+  target_type                    INT NOT NULL DEFAULT 0 CHECK (target_type IN (0, 1)),  -- 作用目标判定：0 = 敌方单位，1 = 我方单位（支援单位对我方回血用）
+  armor_penetration              INT NOT NULL DEFAULT 0,  -- 破甲值：对拥有护甲的敌人能减去的护甲值
+  -- ---- 以下为代码内使用的静态数值（自定字段名与类型）----
+  squad_size                     INT DEFAULT 1,  -- 编队人数：多人独立碰撞体、合并为一个基本单位
+  squad_cap                      INT DEFAULT 1,  -- 该兵种可同时出场的单位数量上限（含训练中）
+
+  roster                         VARCHAR(128) DEFAULT NULL,  -- 编队花名册（逗号分隔；最后一项为队长）
+  character_scale                FLOAT DEFAULT NULL,  -- 角色渲染缩放
+  collision_radius               FLOAT DEFAULT NULL,  -- 单位移动碰撞体半径
+  member_collision_radius        FLOAT DEFAULT NULL,  -- 单名队员的圆形判定体半径
+  formation_side                 FLOAT DEFAULT NULL,  -- 三角阵型边长
+  red_zone_clearance             FLOAT DEFAULT NULL,  -- 与红色屏蔽区边缘保持的安全距离
+  member_separation              FLOAT DEFAULT NULL,  -- 队员之间的最小间距
+  member_enemy_separation        FLOAT DEFAULT NULL,  -- 队员与敌方单位之间的隔离距离
+  regen_delay                    INT DEFAULT NULL,  -- 距上次受击多久开始回血（毫秒）
+  regen_per_second               FLOAT DEFAULT NULL,  -- 每秒恢复的最大生命值比例
+  detonate_delay                 INT DEFAULT NULL,  -- 血条耗尽到自爆/引爆的延迟（毫秒）
+  detonate_radius                FLOAT DEFAULT NULL,  -- 自爆半径（像素）
+  detonate_damage                FLOAT DEFAULT NULL,  -- 爆心伤害
+  detonate_damage_falloff        FLOAT DEFAULT NULL,  -- 每档伤害递减比例
+  detonate_falloff_step          FLOAT DEFAULT NULL,  -- 伤害递减档距（像素）
+  charge_speed                   FLOAT DEFAULT NULL,  -- 阵亡冲锋速度（像素/秒）
+  charge_trigger_distance        FLOAT DEFAULT NULL,  -- 贴上该距离立即自爆（像素）
+  charge_stun_duration           INT DEFAULT NULL,  -- 冲刺近战命中后目标小队陷入待机的时长（毫秒；Guard/Aegis = 1000，Smasher/Kratos = 3000）；>0 = 启用冲刺近战；留空 = 无冲刺
+  death_tint_duration            INT DEFAULT NULL,  -- 阵亡泛红时长（毫秒）
+  death_tint_strength            FLOAT DEFAULT NULL,  -- 阵亡泛红强度
+  track_range                    FLOAT DEFAULT NULL,  -- 追踪范围（敌方 AI，像素）
+  attack_release_margin          FLOAT DEFAULT NULL,  -- 停火迟滞带（像素）
+  track_release_margin           FLOAT DEFAULT NULL,  -- 放弃追踪迟滞带（像素）
+  -- ---- 部署扣点（经济）----
+  deploy_cost                    INT DEFAULT NULL,  -- 驻场削点：场上每存在一个该兵种，每分钟可获得的点数上限减少该值（不直接扣当前点数）
+  -- ---- 队员隔离与归队（我方）----
+  member_separation_max_push     FLOAT DEFAULT NULL,  -- 队员隔离每帧最大推挤位移（像素）
+  member_anim_max_step           FLOAT DEFAULT NULL,  -- 队员渲染位置每帧最大位移（像素）
+  member_return_distance         FLOAT DEFAULT NULL,  -- 掉队判定距离（像素）
+  member_return_exit_ratio       FLOAT DEFAULT NULL,  -- 归队迟滞比例：收进「判定距离 × 该比例」以内才算归位
+  member_return_extra_clearance  FLOAT DEFAULT NULL,  -- 归位通道净空额外量（像素），最终净空 = red_zone_clearance + 该值
+  member_return_speed            FLOAT DEFAULT NULL,  -- 归队移动速度（像素/秒）
+  member_return_replan_distance  FLOAT DEFAULT NULL,  -- 归队路径的重新规划距离阈值（像素）
+  member_return_waypoint_radius  FLOAT DEFAULT NULL,  -- 归队路径拐点的到达判定距离（像素）
+  -- ---- 阵型与收拢（我方）----
+  squad_regroup_arrive           FLOAT DEFAULT NULL,  -- 归位判定距离（像素）
+  squad_regroup_catchup_distance FLOAT DEFAULT NULL,  -- 落后该距离后开始提速归队（像素）
+  squad_regroup_stall_ratio      FLOAT DEFAULT NULL,  -- 单帧靠近量不足预算的该比例即累计卡滞
+  squad_regroup_stall_frames     INT DEFAULT NULL,  -- 连续卡滞帧数达到该值即视为已归位
+  squad_free_return_ratio        FLOAT DEFAULT NULL,  -- 超出自由散开范围后的回收速度倍率（相对行军速度）
+  squad_separation_target        FLOAT DEFAULT NULL,  -- 队形被挤压时的兜底隔离距离（像素）
+  squad_separation_buffer        FLOAT DEFAULT NULL,  -- 队形隔离的收敛容差
+  squad_order_spread             FLOAT DEFAULT NULL,  -- 多队同时移动时终点圆环分摊半径（像素）：越小越贴近点击点，取值需保证相邻小队贴近而不相叠
+  squad_separation_passes        INT DEFAULT NULL,  -- 队员隔离与红区净空交替求解轮数
+  squad_edge_range               FLOAT DEFAULT NULL,  -- 判定「已贴到红色屏蔽区边缘」的额外距离（像素）
+  squad_edge_exit_range          FLOAT DEFAULT NULL,  -- 贴红区判定的退出迟滞距离（像素）
+  squad_formation_lerp           FLOAT DEFAULT NULL,  -- 行进方向插值系数（避免拐角处方向跳变）
+  squad_morph_duration           INT DEFAULT NULL,  -- 三角阵型与自由散开的过渡时长（毫秒）
+  squad_free_spread              FLOAT DEFAULT NULL,  -- 自由移动时的横向展开量（像素）
+  squad_free_max_distance        FLOAT DEFAULT NULL,  -- 队员与队形中心的最大距离（像素）
+  squad_free_back_left           FLOAT DEFAULT NULL,  -- 自由站位「左侧」沿行进方向的落后量（像素）
+  squad_free_back_apex           FLOAT DEFAULT NULL,  -- 自由站位「中间」沿行进方向的落后量（像素，负为更靠前）
+  squad_free_back_right          FLOAT DEFAULT NULL,  -- 自由站位「右侧」沿行进方向的落后量（像素）
+  squad_slot_swap_blend          FLOAT DEFAULT NULL,  -- 允许重新分配站位所需的散开完成度
+  -- ---- 动画（我方）----
+  attack_animation_name          VARCHAR(32) DEFAULT NULL,  -- 攻击动画名（默认 'attack'；TankM1 等美术攻击动作名不同的单位填 'skill1' 等）
+  animation_mix_attack           FLOAT DEFAULT NULL,  -- 攻击与移动/待机交叉淡化时长（秒）
+  animation_mix_loop             FLOAT DEFAULT NULL,  -- 移动与待机交叉淡化时长（秒）
+  attack_animation_fallback      INT DEFAULT NULL,  -- 取不到攻击动画时长时的兜底锁定时长（毫秒）
+  animation_lock_grace           FLOAT DEFAULT NULL,  -- 一次性动画尾帧保留容差（毫秒）
+  spawn_animation_duration       INT DEFAULT NULL,  -- 出生动画时长（毫秒）
+  spawn_animation_min_scale      FLOAT DEFAULT NULL,  -- 出生动画起始缩放（相对正常体型）
+  -- ---- 红区绕行与移动容错（我方）----
+  red_route_range                FLOAT DEFAULT NULL,  -- 「移动路线范围内」的红区判定半径（像素）
+  red_steer_bias                 FLOAT DEFAULT NULL,  -- 沿红色屏蔽区行走时的额外外扩量（保证净空足额）
+  move_stall_timeout             INT DEFAULT NULL,  -- 贴着红区打转、长时间无法靠近终点的判定时长（毫秒）
+  move_progress_epsilon          FLOAT DEFAULT NULL,  -- 判定「确实靠近了终点」的最小距离（像素）
+  charge_retarget_interval       INT DEFAULT NULL,  -- 阵亡冲锋的重新索敌间隔（毫秒）
+  -- ---- 视觉尺寸 ----
+  bar_width                      FLOAT DEFAULT NULL,  -- 血条宽度（像素）
+  shadow_width_ratio             FLOAT DEFAULT NULL,  -- 脚下阴影宽度 / 单位显示宽度
+  shadow_flatten                 FLOAT DEFAULT NULL,  -- 脚下阴影高度 / 宽度
+  shadow_alpha                   FLOAT DEFAULT NULL,  -- 脚下阴影透明度
+  shadow_offset_y                FLOAT DEFAULT NULL,  -- 脚下阴影相对单位原点的纵向偏移（像素）
+  ring_width                     FLOAT DEFAULT NULL,  -- 脚下选中圆环宽度（像素）
+  ring_height                    FLOAT DEFAULT NULL,  -- 脚下选中圆环高度（像素）
+  ring_offset_y                  FLOAT DEFAULT NULL,  -- 脚下选中圆环纵向偏移（像素）
+  -- ---- 敌方 AI 与行动路线 ----
+  hold_duration                  INT DEFAULT NULL,  -- 行动点待机时长（毫秒）
+  patrol_radius                  FLOAT DEFAULT NULL,  -- 待机巡逻范围半径（像素）
+  patrol_min_radius              FLOAT DEFAULT NULL,  -- 巡逻折返的最小半径（像素）
+  patrol_slack                   FLOAT DEFAULT NULL,  -- 巡逻硬约束容差（像素）
+  endpoint_roam_radius           FLOAT DEFAULT NULL,  -- 路线终点自由待机区域半径（像素）
+  endpoint_idle_min              INT DEFAULT NULL,  -- 终点到位后随机静止时长下限（毫秒）
+  endpoint_idle_max              INT DEFAULT NULL,  -- 终点到位后随机静止时长上限（毫秒）
+  endpoint_return_slack_factor   FLOAT DEFAULT NULL,  -- 终点回位距离 = 待机半径 + patrol_slack × 该系数
+  route_corridor                 FLOAT DEFAULT NULL,  -- 移动路线走廊半宽（像素）
+  route_variant_count            INT DEFAULT NULL,  -- 每条主路线生成的随机变体数量
+  spawn_offmap_padding           FLOAT DEFAULT NULL,  -- 出生点在地图外额外补足的入场距离（像素）
+  separation_strength            FLOAT DEFAULT NULL,  -- 单位隔离每帧推开重叠量的比例
+  separation_max_push            FLOAT DEFAULT NULL,  -- 单位隔离每帧最大推挤位移（像素）
+  replan_cooldown                INT DEFAULT NULL,  -- 路径重规划冷却（毫秒）
+  stuck_time                     INT DEFAULT NULL,  -- 卡滞判定时长（毫秒）
+  stuck_distance                 FLOAT DEFAULT NULL,  -- 卡滞判定位移阈值（像素）
+  attack_contact_tolerance       FLOAT DEFAULT NULL,  -- 进入攻击范围的到位容差（像素）
+  attack_animation_loop          INT DEFAULT NULL,  -- 攻击姿态是否循环播放（1 = 循环）
+  knockback_distance             FLOAT DEFAULT NULL,  -- 被击中后的击退距离（像素）
+  knockback_duration             INT DEFAULT NULL,  -- 被击中后的击退持续时间（毫秒）
+  -- ---- 攻击弹丸与溅射（重装单位）----
+  attack_blast_radius            FLOAT DEFAULT NULL,  -- 攻击溅射半径（像素）：命中点周围该范围内的敌人全部受伤；NULL/0 = 单体攻击
+  attack_blast_falloff           FLOAT DEFAULT NULL,  -- 溅射伤害每档向外递减比例（0.2 = 每档降 20%）
+  attack_blast_falloff_step      FLOAT DEFAULT NULL,  -- 溅射伤害递减档距（像素）
+  attack_projectile_size         FLOAT DEFAULT NULL,  -- 攻击弹丸显示尺寸（像素）：NULL = 无弹丸表现（瞬时命中）
+  attack_while_moving            INT DEFAULT NULL,  -- 移动开火：1 = 行进中也能自动开火（NULL/0 = 只有站定才能开火）
+  attack_while_moving_arc        FLOAT DEFAULT NULL,  -- 移动开火的正面射界半角（度）：只锁定行进方向该角度内的敌人；NULL/<=0 = 不限方向
+  attack_facing_required         INT DEFAULT NULL,  -- 面向判定：1 = 只能面向敌方单位时才能攻击（不面向时先自动转身，并等一个攻击间隔再打）；NULL/0 = 不判定朝向
+  -- ---- 攻击弹丸表现（重装单位）----
+  attack_projectile_speed        FLOAT DEFAULT NULL,  -- 弹丸飞行速度（像素/秒）
+  attack_projectile_launch_ratio FLOAT DEFAULT NULL,  -- 出膛时刻占攻击动画时长的比例（0.5 = 动画播到一半出膛，1 = 播完出膛）
+  attack_projectile_bone         VARCHAR(32) DEFAULT NULL,  -- 出膛点所在的骨骼名（TankM1 / Warjack = muzzle、Ares = muzzle1,muzzle2，多骨骼取距目标最近者）；NULL = 无骨骼，改用下面的兜底偏移估算
+  attack_projectile_muzzle_forward FLOAT DEFAULT NULL,  -- 兜底出膛点：沿射向自单位锚点前移（像素）
+  attack_projectile_muzzle_height FLOAT DEFAULT NULL,  -- 兜底出膛点：自单位锚点上移（像素）
+  -- ---- 多部件外观（Warjack）----
+  render_parts                   VARCHAR(255) DEFAULT NULL,  -- 多部件外观：资源键按「从后到前」排列、逗号分隔，最后一个是主体（血条/炮口/染色都取它）；留空 = 单部件
+  -- ---- 阵亡自爆表现（Ares）----
+  death_charge_animation         VARCHAR(32) DEFAULT NULL,  -- 阵亡冲锋中途切换到的动作名（Ares = skill3）；留空 = 全程用冲锋动作
+  death_charge_animation_delay   INT DEFAULT NULL,  -- 进入自爆状态后多少毫秒切到上面的动作（Ares = 0，一进入自爆状态就直接播 skill3 第一秒）
+  -- ---- 近战（Warjack）----
+  melee_range                    FLOAT DEFAULT NULL,  -- 近战触发距离：自身碰撞体之外再多该距离内有敌人就打近战；留空 = 没有近战
+  melee_animation_name           VARCHAR(32) DEFAULT NULL,  -- 近战动作名（Warjack = attack_SP）
+  melee_ignore_armor             INT DEFAULT NULL,  -- 近战是否无视护甲（1 = 无视，按防守方护甲为 0 结算）
+  -- ---- 外观朝向（Ares）----
+  art_facing_left                INT DEFAULT NULL,  -- 素材本身朝向：1 = 原图朝左（渲染朝向与其它单位相反，Ares）；留空 = 原图朝右
+  -- ---- 开局召唤分身（SF / Agent）----
+  summon_animation_name          VARCHAR(32) DEFAULT NULL,  -- 开局召唤动画（SF = skill2，本体播放）；留空 = 无召唤
+  summon_clone_count             INT DEFAULT NULL,  -- 开局召唤的分身数量（SF = 2，分身数值与机制完全继承本体）；留空 = 不召唤
+  summon_clone_delay             INT DEFAULT NULL   -- 召唤动画播到多少毫秒时分身落地（SF = 1400，skill2 全长 2833ms 的中段）
+);
+INSERT INTO enemy_heavy (
+  unit_id, unit_name, cost, build_time, max_hp, armor, move_speed, action_range,
+  action_value, action_cd, target_type, armor_penetration, squad_size, squad_cap,
+  roster, character_scale, collision_radius, red_zone_clearance, detonate_delay,
+  detonate_radius, detonate_damage, charge_speed, charge_stun_duration,
+  track_range, attack_release_margin, track_release_margin, deploy_cost,
+  bar_width, hold_duration, patrol_radius, patrol_min_radius, patrol_slack,
+  endpoint_roam_radius, endpoint_idle_min, endpoint_idle_max,
+  endpoint_return_slack_factor, route_corridor, route_variant_count,
+  spawn_offmap_padding, separation_strength, separation_max_push,
+  replan_cooldown, stuck_time, stuck_distance, attack_contact_tolerance,
+  attack_animation_loop, knockback_distance, knockback_duration
+) VALUES (
+  'Smasher',
+  'Smasher',
+  0,
+  0,
+  450,
+  12,
+  150,
+  10,
+  12,
+  1,
+  0,
+  6,
+  1,
+  1,
+  'Smasher',
+  0.59,
+  20.5,
+  19,
+  3000,
+  80,
+  50,
+  320,
+  3000,
+  240,
+  12,
+  16,
+  0,
+  70.5,
+  5000,
+  37.5,
+  15,
+  22.5,
+  187.5,
+  1200,
+  4000,
+  4,
+  38,
+  5,
+  90,
+  1,
+  7.5,
+  700,
+  1000,
+  9.5,
+  2,
+  1,
+  10,
+  500
+);
+INSERT INTO enemy_heavy (
+  unit_id, unit_name, cost, build_time, max_hp, armor, move_speed, action_range,
+  action_value, action_cd, target_type, armor_penetration, squad_size, squad_cap,
+  roster, character_scale, collision_radius, red_zone_clearance, detonate_delay,
+  detonate_radius, detonate_damage, charge_speed, charge_stun_duration,
+  track_range, attack_release_margin, track_release_margin, deploy_cost,
+  bar_width, hold_duration, patrol_radius, patrol_min_radius, patrol_slack,
+  endpoint_roam_radius, endpoint_idle_min, endpoint_idle_max,
+  endpoint_return_slack_factor, route_corridor, route_variant_count,
+  spawn_offmap_padding, separation_strength, separation_max_push,
+  replan_cooldown, stuck_time, stuck_distance, attack_contact_tolerance,
+  attack_animation_loop, knockback_distance, knockback_duration
+) VALUES (
+  'Kratos',
+  'Kratos',
+  0,
+  0,
+  400,
+  8,
+  150,
+  15,
+  12,
+  1,
+  0,
+  12,
+  1,
+  1,
+  'Kratos',
+  0.54,
+  20.5,
+  19,
+  3000,
+  80,
+  50,
+  300,
+  3000,
+  240,
+  12,
+  16,
+  0,
+  70.5,
+  5000,
+  37.5,
+  15,
+  22.5,
+  187.5,
+  1200,
+  4000,
+  4,
+  38,
+  5,
+  90,
+  1,
+  7.5,
+  700,
+  1000,
+  9.5,
+  2,
+  1,
+  10,
+  500
+);
+
+
+
+DROP TABLE IF EXISTS enemy_support;
+CREATE TABLE enemy_support (  -- 敌方支援，id 待定
+  unit_id                        VARCHAR(32) NOT NULL PRIMARY KEY,  -- 单位唯一标识
+  unit_name                      VARCHAR(32) DEFAULT NULL,  -- 显示名
+  cost                           INT NOT NULL DEFAULT 0,  -- 招募消耗：出兵时从可用点数中一次性扣除的点数
+  build_time                     FLOAT NOT NULL DEFAULT 0,  -- 训练耗时（秒）
+  max_hp                         INT NOT NULL DEFAULT 1,  -- 最大生命值
+  armor                          INT NOT NULL DEFAULT 0,  -- 固定减伤护甲
+  move_speed                     FLOAT NOT NULL DEFAULT 0,  -- 移动速度（像素/秒）
+  action_range                   FLOAT NOT NULL DEFAULT 0,  -- 攻击/作用距离（像素）
+  action_value                   INT NOT NULL DEFAULT 0,  -- 作用数值（正为伤害/治疗）
+  action_cd                      FLOAT NOT NULL DEFAULT 0,  -- 技能冷却/攻击间隔（秒）
+  target_type                    INT NOT NULL DEFAULT 0 CHECK (target_type IN (0, 1)),  -- 作用目标判定：0 = 敌方单位，1 = 我方单位（支援单位对我方回血用）
+  armor_penetration              INT NOT NULL DEFAULT 0,  -- 破甲值：对拥有护甲的敌人能减去的护甲值
+  -- ---- 以下为代码内使用的静态数值（自定字段名与类型）----
+  squad_size                     INT DEFAULT 1,  -- 编队人数：多人独立碰撞体、合并为一个基本单位
+  squad_cap                      INT DEFAULT 1,  -- 该兵种可同时出场的单位数量上限（含训练中）
+
+  roster                         VARCHAR(128) DEFAULT NULL,  -- 编队花名册（逗号分隔；最后一项为队长）
+  character_scale                FLOAT DEFAULT NULL,  -- 角色渲染缩放
+  collision_radius               FLOAT DEFAULT NULL,  -- 单位移动碰撞体半径
+  member_collision_radius        FLOAT DEFAULT NULL,  -- 单名队员的圆形判定体半径
+  formation_side                 FLOAT DEFAULT NULL,  -- 三角阵型边长
+  red_zone_clearance             FLOAT DEFAULT NULL,  -- 与红色屏蔽区边缘保持的安全距离
+  member_separation              FLOAT DEFAULT NULL,  -- 队员之间的最小间距
+  member_enemy_separation        FLOAT DEFAULT NULL,  -- 队员与敌方单位之间的隔离距离
+  regen_delay                    INT DEFAULT NULL,  -- 距上次受击多久开始回血（毫秒）
+  regen_per_second               FLOAT DEFAULT NULL,  -- 每秒恢复的最大生命值比例
+  detonate_delay                 INT DEFAULT NULL,  -- 血条耗尽到自爆/引爆的延迟（毫秒）
+  detonate_radius                FLOAT DEFAULT NULL,  -- 自爆半径（像素）
+  detonate_damage                FLOAT DEFAULT NULL,  -- 爆心伤害
+  detonate_damage_falloff        FLOAT DEFAULT NULL,  -- 每档伤害递减比例
+  detonate_falloff_step          FLOAT DEFAULT NULL,  -- 伤害递减档距（像素）
+  charge_speed                   FLOAT DEFAULT NULL,  -- 阵亡冲锋速度（像素/秒）
+  charge_trigger_distance        FLOAT DEFAULT NULL,  -- 贴上该距离立即自爆（像素）
+  charge_stun_duration           INT DEFAULT NULL,  -- 冲刺近战命中后目标小队陷入待机的时长（毫秒；Guard/Aegis = 1000，Smasher/Kratos = 3000）；>0 = 启用冲刺近战；留空 = 无冲刺
+  death_tint_duration            INT DEFAULT NULL,  -- 阵亡泛红时长（毫秒）
+  death_tint_strength            FLOAT DEFAULT NULL,  -- 阵亡泛红强度
+  track_range                    FLOAT DEFAULT NULL,  -- 追踪范围（敌方 AI，像素）
+  attack_release_margin          FLOAT DEFAULT NULL,  -- 停火迟滞带（像素）
+  track_release_margin           FLOAT DEFAULT NULL,  -- 放弃追踪迟滞带（像素）
+  -- ---- 部署扣点（经济）----
+  deploy_cost                    INT DEFAULT NULL,  -- 驻场削点：场上每存在一个该兵种，每分钟可获得的点数上限减少该值（不直接扣当前点数）
+  -- ---- 队员隔离与归队（我方）----
+  member_separation_max_push     FLOAT DEFAULT NULL,  -- 队员隔离每帧最大推挤位移（像素）
+  member_anim_max_step           FLOAT DEFAULT NULL,  -- 队员渲染位置每帧最大位移（像素）
+  member_return_distance         FLOAT DEFAULT NULL,  -- 掉队判定距离（像素）
+  member_return_exit_ratio       FLOAT DEFAULT NULL,  -- 归队迟滞比例：收进「判定距离 × 该比例」以内才算归位
+  member_return_extra_clearance  FLOAT DEFAULT NULL,  -- 归位通道净空额外量（像素），最终净空 = red_zone_clearance + 该值
+  member_return_speed            FLOAT DEFAULT NULL,  -- 归队移动速度（像素/秒）
+  member_return_replan_distance  FLOAT DEFAULT NULL,  -- 归队路径的重新规划距离阈值（像素）
+  member_return_waypoint_radius  FLOAT DEFAULT NULL,  -- 归队路径拐点的到达判定距离（像素）
+  -- ---- 阵型与收拢（我方）----
+  squad_regroup_arrive           FLOAT DEFAULT NULL,  -- 归位判定距离（像素）
+  squad_regroup_catchup_distance FLOAT DEFAULT NULL,  -- 落后该距离后开始提速归队（像素）
+  squad_regroup_stall_ratio      FLOAT DEFAULT NULL,  -- 单帧靠近量不足预算的该比例即累计卡滞
+  squad_regroup_stall_frames     INT DEFAULT NULL,  -- 连续卡滞帧数达到该值即视为已归位
+  squad_free_return_ratio        FLOAT DEFAULT NULL,  -- 超出自由散开范围后的回收速度倍率（相对行军速度）
+  squad_separation_target        FLOAT DEFAULT NULL,  -- 队形被挤压时的兜底隔离距离（像素）
+  squad_separation_buffer        FLOAT DEFAULT NULL,  -- 队形隔离的收敛容差
+  squad_order_spread             FLOAT DEFAULT NULL,  -- 多队同时移动时终点圆环分摊半径（像素）：越小越贴近点击点，取值需保证相邻小队贴近而不相叠
+  squad_separation_passes        INT DEFAULT NULL,  -- 队员隔离与红区净空交替求解轮数
+  squad_edge_range               FLOAT DEFAULT NULL,  -- 判定「已贴到红色屏蔽区边缘」的额外距离（像素）
+  squad_edge_exit_range          FLOAT DEFAULT NULL,  -- 贴红区判定的退出迟滞距离（像素）
+  squad_formation_lerp           FLOAT DEFAULT NULL,  -- 行进方向插值系数（避免拐角处方向跳变）
+  squad_morph_duration           INT DEFAULT NULL,  -- 三角阵型与自由散开的过渡时长（毫秒）
+  squad_free_spread              FLOAT DEFAULT NULL,  -- 自由移动时的横向展开量（像素）
+  squad_free_max_distance        FLOAT DEFAULT NULL,  -- 队员与队形中心的最大距离（像素）
+  squad_free_back_left           FLOAT DEFAULT NULL,  -- 自由站位「左侧」沿行进方向的落后量（像素）
+  squad_free_back_apex           FLOAT DEFAULT NULL,  -- 自由站位「中间」沿行进方向的落后量（像素，负为更靠前）
+  squad_free_back_right          FLOAT DEFAULT NULL,  -- 自由站位「右侧」沿行进方向的落后量（像素）
+  squad_slot_swap_blend          FLOAT DEFAULT NULL,  -- 允许重新分配站位所需的散开完成度
+  -- ---- 动画（我方）----
+  attack_animation_name          VARCHAR(32) DEFAULT NULL,  -- 攻击动画名（默认 'attack'；TankM1 等美术攻击动作名不同的单位填 'skill1' 等）
+  animation_mix_attack           FLOAT DEFAULT NULL,  -- 攻击与移动/待机交叉淡化时长（秒）
+  animation_mix_loop             FLOAT DEFAULT NULL,  -- 移动与待机交叉淡化时长（秒）
+  attack_animation_fallback      INT DEFAULT NULL,  -- 取不到攻击动画时长时的兜底锁定时长（毫秒）
+  animation_lock_grace           FLOAT DEFAULT NULL,  -- 一次性动画尾帧保留容差（毫秒）
+  spawn_animation_duration       INT DEFAULT NULL,  -- 出生动画时长（毫秒）
+  spawn_animation_min_scale      FLOAT DEFAULT NULL,  -- 出生动画起始缩放（相对正常体型）
+  -- ---- 红区绕行与移动容错（我方）----
+  red_route_range                FLOAT DEFAULT NULL,  -- 「移动路线范围内」的红区判定半径（像素）
+  red_steer_bias                 FLOAT DEFAULT NULL,  -- 沿红色屏蔽区行走时的额外外扩量（保证净空足额）
+  move_stall_timeout             INT DEFAULT NULL,  -- 贴着红区打转、长时间无法靠近终点的判定时长（毫秒）
+  move_progress_epsilon          FLOAT DEFAULT NULL,  -- 判定「确实靠近了终点」的最小距离（像素）
+  charge_retarget_interval       INT DEFAULT NULL,  -- 阵亡冲锋的重新索敌间隔（毫秒）
+  -- ---- 视觉尺寸 ----
+  bar_width                      FLOAT DEFAULT NULL,  -- 血条宽度（像素）
+  shadow_width_ratio             FLOAT DEFAULT NULL,  -- 脚下阴影宽度 / 单位显示宽度
+  shadow_flatten                 FLOAT DEFAULT NULL,  -- 脚下阴影高度 / 宽度
+  shadow_alpha                   FLOAT DEFAULT NULL,  -- 脚下阴影透明度
+  shadow_offset_y                FLOAT DEFAULT NULL,  -- 脚下阴影相对单位原点的纵向偏移（像素）
+  ring_width                     FLOAT DEFAULT NULL,  -- 脚下选中圆环宽度（像素）
+  ring_height                    FLOAT DEFAULT NULL,  -- 脚下选中圆环高度（像素）
+  ring_offset_y                  FLOAT DEFAULT NULL,  -- 脚下选中圆环纵向偏移（像素）
+  -- ---- 敌方 AI 与行动路线 ----
+  hold_duration                  INT DEFAULT NULL,  -- 行动点待机时长（毫秒）
+  patrol_radius                  FLOAT DEFAULT NULL,  -- 待机巡逻范围半径（像素）
+  patrol_min_radius              FLOAT DEFAULT NULL,  -- 巡逻折返的最小半径（像素）
+  patrol_slack                   FLOAT DEFAULT NULL,  -- 巡逻硬约束容差（像素）
+  endpoint_roam_radius           FLOAT DEFAULT NULL,  -- 路线终点自由待机区域半径（像素）
+  endpoint_idle_min              INT DEFAULT NULL,  -- 终点到位后随机静止时长下限（毫秒）
+  endpoint_idle_max              INT DEFAULT NULL,  -- 终点到位后随机静止时长上限（毫秒）
+  endpoint_return_slack_factor   FLOAT DEFAULT NULL,  -- 终点回位距离 = 待机半径 + patrol_slack × 该系数
+  route_corridor                 FLOAT DEFAULT NULL,  -- 移动路线走廊半宽（像素）
+  route_variant_count            INT DEFAULT NULL,  -- 每条主路线生成的随机变体数量
+  spawn_offmap_padding           FLOAT DEFAULT NULL,  -- 出生点在地图外额外补足的入场距离（像素）
+  separation_strength            FLOAT DEFAULT NULL,  -- 单位隔离每帧推开重叠量的比例
+  separation_max_push            FLOAT DEFAULT NULL,  -- 单位隔离每帧最大推挤位移（像素）
+  replan_cooldown                INT DEFAULT NULL,  -- 路径重规划冷却（毫秒）
+  stuck_time                     INT DEFAULT NULL,  -- 卡滞判定时长（毫秒）
+  stuck_distance                 FLOAT DEFAULT NULL,  -- 卡滞判定位移阈值（像素）
+  attack_contact_tolerance       FLOAT DEFAULT NULL,  -- 进入攻击范围的到位容差（像素）
+  attack_animation_loop          INT DEFAULT NULL,  -- 攻击姿态是否循环播放（1 = 循环）
+  knockback_distance             FLOAT DEFAULT NULL,  -- 被击中后的击退距离（像素）
+  knockback_duration             INT DEFAULT NULL,  -- 被击中后的击退持续时间（毫秒）
+  -- ---- 攻击弹丸与溅射（重装单位）----
+  attack_blast_radius            FLOAT DEFAULT NULL,  -- 攻击溅射半径（像素）：命中点周围该范围内的敌人全部受伤；NULL/0 = 单体攻击
+  attack_blast_falloff           FLOAT DEFAULT NULL,  -- 溅射伤害每档向外递减比例（0.2 = 每档降 20%）
+  attack_blast_falloff_step      FLOAT DEFAULT NULL,  -- 溅射伤害递减档距（像素）
+  attack_projectile_size         FLOAT DEFAULT NULL,  -- 攻击弹丸显示尺寸（像素）：NULL = 无弹丸表现（瞬时命中）
+  attack_while_moving            INT DEFAULT NULL,  -- 移动开火：1 = 行进中也能自动开火（NULL/0 = 只有站定才能开火）
+  attack_while_moving_arc        FLOAT DEFAULT NULL,  -- 移动开火的正面射界半角（度）：只锁定行进方向该角度内的敌人；NULL/<=0 = 不限方向
+  attack_facing_required         INT DEFAULT NULL,  -- 面向判定：1 = 只能面向敌方单位时才能攻击（不面向时先自动转身，并等一个攻击间隔再打）；NULL/0 = 不判定朝向
+  -- ---- 攻击弹丸表现（重装单位）----
+  attack_projectile_speed        FLOAT DEFAULT NULL,  -- 弹丸飞行速度（像素/秒）
+  attack_projectile_launch_ratio FLOAT DEFAULT NULL,  -- 出膛时刻占攻击动画时长的比例（0.5 = 动画播到一半出膛，1 = 播完出膛）
+  attack_projectile_bone         VARCHAR(32) DEFAULT NULL,  -- 出膛点所在的骨骼名（TankM1 / Warjack = muzzle、Ares = muzzle1,muzzle2，多骨骼取距目标最近者）；NULL = 无骨骼，改用下面的兜底偏移估算
+  attack_projectile_muzzle_forward FLOAT DEFAULT NULL,  -- 兜底出膛点：沿射向自单位锚点前移（像素）
+  attack_projectile_muzzle_height FLOAT DEFAULT NULL,  -- 兜底出膛点：自单位锚点上移（像素）
+  -- ---- 多部件外观（Warjack）----
+  render_parts                   VARCHAR(255) DEFAULT NULL,  -- 多部件外观：资源键按「从后到前」排列、逗号分隔，最后一个是主体（血条/炮口/染色都取它）；留空 = 单部件
+  -- ---- 阵亡自爆表现（Ares）----
+  death_charge_animation         VARCHAR(32) DEFAULT NULL,  -- 阵亡冲锋中途切换到的动作名（Ares = skill3）；留空 = 全程用冲锋动作
+  death_charge_animation_delay   INT DEFAULT NULL,  -- 进入自爆状态后多少毫秒切到上面的动作（Ares = 0，一进入自爆状态就直接播 skill3 第一秒）
+  -- ---- 近战（Warjack）----
+  melee_range                    FLOAT DEFAULT NULL,  -- 近战触发距离：自身碰撞体之外再多该距离内有敌人就打近战；留空 = 没有近战
+  melee_animation_name           VARCHAR(32) DEFAULT NULL,  -- 近战动作名（Warjack = attack_SP）
+  melee_ignore_armor             INT DEFAULT NULL,  -- 近战是否无视护甲（1 = 无视，按防守方护甲为 0 结算）
+  -- ---- 外观朝向（Ares）----
+  art_facing_left                INT DEFAULT NULL,  -- 素材本身朝向：1 = 原图朝左（渲染朝向与其它单位相反，Ares）；留空 = 原图朝右
+  -- ---- 开局召唤分身（SF / Agent）----
+  summon_animation_name          VARCHAR(32) DEFAULT NULL,  -- 开局召唤动画（SF = skill2，本体播放）；留空 = 无召唤
+  summon_clone_count             INT DEFAULT NULL,  -- 开局召唤的分身数量（SF = 2，分身数值与机制完全继承本体）；留空 = 不召唤
+  summon_clone_delay             INT DEFAULT NULL   -- 召唤动画播到多少毫秒时分身落地（SF = 1400，skill2 全长 2833ms 的中段）
+);
+INSERT INTO enemy_support (
+  unit_id, unit_name, cost, build_time, max_hp, armor, move_speed, action_range,
+  action_value, action_cd, target_type, armor_penetration, squad_size, squad_cap,
+  roster, character_scale, collision_radius, red_zone_clearance, detonate_delay,
+  detonate_radius, detonate_damage, track_range, attack_release_margin,
+  track_release_margin, deploy_cost, bar_width, hold_duration, patrol_radius,
+  patrol_min_radius, patrol_slack, endpoint_roam_radius, endpoint_idle_min,
+  endpoint_idle_max, endpoint_return_slack_factor, route_corridor,
+  route_variant_count, spawn_offmap_padding, separation_strength,
+  separation_max_push, replan_cooldown, stuck_time, stuck_distance,
+  attack_contact_tolerance, attack_animation_loop, knockback_distance,
+  knockback_duration
+) VALUES (
+  'Zombie1',
+  'Zombie1',
+  0,
+  0,
+  140,
+  10,
+  120,
+  5,
+  5,
+  0.7,
+  0,
+  12,
+  1,
+  1,
+  'Zombie1',
+  0.272,
+  20.5,
+  19,
+  3000,
+  40,
+  8,
+  240,
+  12,
+  16,
+  0,
+  56.5,
+  5000,
+  37.5,
+  15,
+  22.5,
+  187.5,
+  1200,
+  4000,
+  4,
+  38,
+  5,
+  90,
+  1,
+  7.5,
+  700,
+  1000,
+  9.5,
+  2,
+  1,
+  10,
+  500
+);
+INSERT INTO enemy_support (
+  unit_id, unit_name, cost, build_time, max_hp, armor, move_speed, action_range,
+  action_value, action_cd, target_type, armor_penetration, squad_size, squad_cap,
+  roster, character_scale, collision_radius, red_zone_clearance, detonate_delay,
+  detonate_radius, detonate_damage, track_range, attack_release_margin,
+  track_release_margin, deploy_cost, bar_width, hold_duration, patrol_radius,
+  patrol_min_radius, patrol_slack, endpoint_roam_radius, endpoint_idle_min,
+  endpoint_idle_max, endpoint_return_slack_factor, route_corridor,
+  route_variant_count, spawn_offmap_padding, separation_strength,
+  separation_max_push, replan_cooldown, stuck_time, stuck_distance,
+  attack_contact_tolerance, attack_animation_loop, knockback_distance,
+  knockback_duration
+) VALUES (
+  'Zombie2',
+  'Zombie2',
+  0,
+  0,
+  150,
+  10,
+  150,
+  180,
+  6,
+  1,
+  0,
+  8,
+  1,
+  1,
+  'Zombie2',
+  0.272,
+  20.5,
+  19,
+  3000,
+  40,
+  8,
+  240,
+  12,
+  16,
+  0,
+  56.5,
+  5000,
+  37.5,
+  15,
+  22.5,
+  187.5,
+  1200,
+  4000,
+  4,
+  38,
+  5,
+  90,
+  1,
+  7.5,
+  700,
+  1000,
+  9.5,
+  2,
+  1,
+  10,
+  500
+);
+INSERT INTO enemy_support (
+  unit_id, unit_name, cost, build_time, max_hp, armor, move_speed, action_range,
+  action_value, action_cd, target_type, armor_penetration, squad_size, squad_cap,
+  roster, character_scale, collision_radius, red_zone_clearance, detonate_delay,
+  detonate_radius, detonate_damage, track_range, attack_release_margin,
+  track_release_margin, deploy_cost, bar_width, hold_duration, patrol_radius,
+  patrol_min_radius, patrol_slack, endpoint_roam_radius, endpoint_idle_min,
+  endpoint_idle_max, endpoint_return_slack_factor, route_corridor,
+  route_variant_count, spawn_offmap_padding, separation_strength,
+  separation_max_push, replan_cooldown, stuck_time, stuck_distance,
+  attack_contact_tolerance, attack_animation_loop, knockback_distance,
+  knockback_duration
+) VALUES (
+  'Strelet',
+  'Strelet',
+  0,
+  0,
+  100,
+  10,
+  150,
+  180,
+  5,
+  1,
+  0,
+  10,
+  1,
+  1,
+  'Strelet',
+  0.272,
+  20.5,
+  19,
+  3000,
+  40,
+  15,
+  240,
+  12,
+  16,
+  0,
+  56.5,
+  5000,
+  37.5,
+  15,
+  22.5,
+  187.5,
+  1200,
+  4000,
+  4,
+  38,
+  5,
+  90,
+  1,
+  7.5,
+  700,
+  1000,
+  9.5,
+  2,
+  1,
+  10,
+  500
+);
+
+
+
+
+INSERT INTO player_infantry (
+  unit_id, unit_name, cost, build_time, max_hp, armor, move_speed, action_range,
+  action_value, action_cd, target_type, armor_penetration, squad_size, squad_cap,
+  roster, character_scale, collision_radius, member_collision_radius,
+  formation_side, red_zone_clearance, member_separation, member_enemy_separation,
+  regen_delay, regen_per_second, detonate_delay, detonate_radius,
+  detonate_damage, detonate_damage_falloff, detonate_falloff_step, charge_speed,
+  charge_trigger_distance, charge_stun_duration, death_tint_duration,
+  death_tint_strength, track_range, attack_release_margin, track_release_margin,
+  deploy_cost, member_separation_max_push, member_anim_max_step,
+  member_return_distance, member_return_exit_ratio,
+  member_return_extra_clearance, member_return_speed,
+  member_return_replan_distance, member_return_waypoint_radius,
+  squad_regroup_arrive, squad_regroup_catchup_distance,
+  squad_regroup_stall_ratio, squad_regroup_stall_frames, squad_free_return_ratio,
+  squad_separation_target, squad_separation_buffer, squad_order_spread,
+  squad_separation_passes, squad_edge_range, squad_edge_exit_range,
+  squad_formation_lerp, squad_morph_duration, squad_free_spread,
+  squad_free_max_distance, squad_free_back_left, squad_free_back_apex,
+  squad_free_back_right, squad_slot_swap_blend, attack_animation_name,
+  animation_mix_attack, animation_mix_loop, attack_animation_fallback,
+  animation_lock_grace, spawn_animation_duration, spawn_animation_min_scale,
+  red_route_range, red_steer_bias, move_stall_timeout, move_progress_epsilon,
+  charge_retarget_interval, bar_width, shadow_width_ratio, shadow_flatten,
+  shadow_alpha, shadow_offset_y, ring_width, ring_height, ring_offset_y,
+  hold_duration, patrol_radius, patrol_min_radius, patrol_slack,
+  endpoint_roam_radius, endpoint_idle_min, endpoint_idle_max,
+  endpoint_return_slack_factor, route_corridor, route_variant_count,
+  spawn_offmap_padding, separation_strength, separation_max_push,
+  replan_cooldown, stuck_time, stuck_distance, attack_contact_tolerance,
+  attack_animation_loop, knockback_distance, knockback_duration,
+  attack_blast_radius, attack_blast_falloff, attack_blast_falloff_step,
+  attack_projectile_size, attack_while_moving, attack_while_moving_arc,
+  attack_facing_required, attack_projectile_speed,
+  attack_projectile_launch_ratio, attack_projectile_bone,
+  attack_projectile_muzzle_forward, attack_projectile_muzzle_height,
+  render_parts, death_charge_animation, death_charge_animation_delay,
+  melee_range, melee_animation_name, melee_ignore_armor, art_facing_left,
+  summon_animation_name, summon_clone_count, summon_clone_delay
+) VALUES (
+  'JF',
+  'JF',
+  50,
+  30,
+  65,
+  8,
+  230,
+  300,
+  6,
+  0.5,
+  0,
+  8,
+  3,
+  4,
+  'Jiangyu,Qiongjiu,Daiyan',
+  0.5625,
+  30,
+  17,
+  56.5,
+  19,
+  19,
+  37.5,
+  5000,
+  0.05,
+  5000,
+  50,
+  20,
+  0.2,
+  10,
+  244,
+  37.5,
+  NULL,
+  900,
+  0.25,
+  NULL,
+  NULL,
+  NULL,
+  10,
+  7.5,
+  4.9,
+  112.5,
+  0.5,
+  7.5,
+  262.5,
+  75,
+  7.5,
+  2.8,
+  30,
+  0.25,
+  20,
+  1.15,
+  28,
+  0.05,
+  60,
+  6,
+  11.5,
+  26.5,
+  0.25,
+  560,
+  30,
+  86.5,
+  11.5,
+  -19,
+  7.5,
+  0.97,
+  'attack',
+  0.12,
+  0.16,
+  600,
+  20,
+  720,
+  0.3,
+  281.5,
+  0.15,
+  1600,
+  0.95,
+  300,
+  37.5,
+  0.66,
+  0.27,
+  0.32,
+  2,
+  37.5,
+  17,
+  4,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL
+);
+
+INSERT INTO enemy_infantry (
+  unit_id, unit_name, cost, build_time, max_hp, armor, move_speed, action_range,
+  action_value, action_cd, target_type, armor_penetration, squad_size, squad_cap,
+  roster, character_scale, collision_radius, member_collision_radius,
+  formation_side, red_zone_clearance, member_separation, member_enemy_separation,
+  regen_delay, regen_per_second, detonate_delay, detonate_radius,
+  detonate_damage, detonate_damage_falloff, detonate_falloff_step, charge_speed,
+  charge_trigger_distance, charge_stun_duration, death_tint_duration,
+  death_tint_strength, track_range, attack_release_margin, track_release_margin,
+  deploy_cost, member_separation_max_push, member_anim_max_step,
+  member_return_distance, member_return_exit_ratio,
+  member_return_extra_clearance, member_return_speed,
+  member_return_replan_distance, member_return_waypoint_radius,
+  squad_regroup_arrive, squad_regroup_catchup_distance,
+  squad_regroup_stall_ratio, squad_regroup_stall_frames, squad_free_return_ratio,
+  squad_separation_target, squad_separation_buffer, squad_order_spread,
+  squad_separation_passes, squad_edge_range, squad_edge_exit_range,
+  squad_formation_lerp, squad_morph_duration, squad_free_spread,
+  squad_free_max_distance, squad_free_back_left, squad_free_back_apex,
+  squad_free_back_right, squad_slot_swap_blend, attack_animation_name,
+  animation_mix_attack, animation_mix_loop, attack_animation_fallback,
+  animation_lock_grace, spawn_animation_duration, spawn_animation_min_scale,
+  red_route_range, red_steer_bias, move_stall_timeout, move_progress_epsilon,
+  charge_retarget_interval, bar_width, shadow_width_ratio, shadow_flatten,
+  shadow_alpha, shadow_offset_y, ring_width, ring_height, ring_offset_y,
+  hold_duration, patrol_radius, patrol_min_radius, patrol_slack,
+  endpoint_roam_radius, endpoint_idle_min, endpoint_idle_max,
+  endpoint_return_slack_factor, route_corridor, route_variant_count,
+  spawn_offmap_padding, separation_strength, separation_max_push,
+  replan_cooldown, stuck_time, stuck_distance, attack_contact_tolerance,
+  attack_animation_loop, knockback_distance, knockback_duration,
+  attack_blast_radius, attack_blast_falloff, attack_blast_falloff_step,
+  attack_projectile_size, attack_while_moving, attack_while_moving_arc,
+  attack_facing_required, attack_projectile_speed,
+  attack_projectile_launch_ratio, attack_projectile_bone,
+  attack_projectile_muzzle_forward, attack_projectile_muzzle_height,
+  render_parts, death_charge_animation, death_charge_animation_delay,
+  melee_range, melee_animation_name, melee_ignore_armor, art_facing_left,
+  summon_animation_name, summon_clone_count, summon_clone_delay
+) VALUES (
+  'Vespid',
+  'Vespid',
+  0,
+  0,
+  60,
+  8,
+  150,
+  200,
+  4,
+  1,
+  0,
+  8,
+  1,
+  1,
+  'Vespid',
+  0.272,
+  20.5,
+  NULL,
+  NULL,
+  19,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  3000,
+  40,
+  8,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  240,
+  12,
+  16,
+  0,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  56.5,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  5000,
+  37.5,
+  15,
+  22.5,
+  187.5,
+  1200,
+  4000,
+  4,
+  38,
+  5,
+  90,
+  1,
+  7.5,
+  700,
+  1000,
+  9.5,
+  2,
+  1,
+  10,
+  500,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL
+);
+INSERT INTO enemy_infantry (
+  unit_id, unit_name, cost, build_time, max_hp, armor, move_speed, action_range,
+  action_value, action_cd, target_type, armor_penetration, squad_size, squad_cap,
+  roster, character_scale, collision_radius, red_zone_clearance, detonate_delay,
+  detonate_radius, detonate_damage, charge_speed, charge_stun_duration,
+  track_range, attack_release_margin, track_release_margin, deploy_cost,
+  bar_width, hold_duration, patrol_radius, patrol_min_radius, patrol_slack,
+  endpoint_roam_radius, endpoint_idle_min, endpoint_idle_max,
+  endpoint_return_slack_factor, route_corridor, route_variant_count,
+  spawn_offmap_padding, separation_strength, separation_max_push,
+  replan_cooldown, stuck_time, stuck_distance, attack_contact_tolerance,
+  attack_animation_loop, knockback_distance, knockback_duration
+) VALUES (
+  'Guard',
+  'Guard',
+  0,
+  0,
+  100,
+  10,
+  120,
+  20,
+  5,
+  1,
+  0,
+  10,
+  1,
+  1,
+  'Guard',
+  0.272,
+  20.5,
+  19,
+  3000,
+  40,
+  8,
+  240,
+  1000,
+  240,
+  12,
+  16,
+  0,
+  56.5,
+  5000,
+  37.5,
+  15,
+  22.5,
+  187.5,
+  1200,
+  4000,
+  4,
+  38,
+  5,
+  90,
+  1,
+  7.5,
+  700,
+  1000,
+  9.5,
+  2,
+  1,
+  10,
+  500
+);
+INSERT INTO enemy_infantry (
+  unit_id, unit_name, cost, build_time, max_hp, armor, move_speed, action_range,
+  action_value, action_cd, target_type, armor_penetration, squad_size, squad_cap,
+  roster, character_scale, collision_radius, red_zone_clearance, detonate_delay,
+  detonate_radius, detonate_damage, track_range, attack_release_margin,
+  track_release_margin, deploy_cost, bar_width, hold_duration, patrol_radius,
+  patrol_min_radius, patrol_slack, endpoint_roam_radius, endpoint_idle_min,
+  endpoint_idle_max, endpoint_return_slack_factor, route_corridor,
+  route_variant_count, spawn_offmap_padding, separation_strength,
+  separation_max_push, replan_cooldown, stuck_time, stuck_distance,
+  attack_contact_tolerance, attack_animation_loop, knockback_distance,
+  knockback_duration
+) VALUES (
+  'Striker',
+  'Striker',
+  0,
+  0,
+  80,
+  8,
+  150,
+  230,
+  4,
+  0.5,
+  0,
+  10,
+  1,
+  1,
+  'Striker',
+  0.272,
+  20.5,
+  19,
+  3000,
+  40,
+  8,
+  240,
+  12,
+  16,
+  0,
+  56.5,
+  5000,
+  37.5,
+  15,
+  22.5,
+  187.5,
+  1200,
+  4000,
+  4,
+  38,
+  5,
+  90,
+  1,
+  7.5,
+  700,
+  1000,
+  9.5,
+  2,
+  1,
+  10,
+  500
+);
+INSERT INTO enemy_infantry (
+  unit_id, unit_name, cost, build_time, max_hp, armor, move_speed, action_range,
+  action_value, action_cd, target_type, armor_penetration, squad_size, squad_cap,
+  roster, character_scale, collision_radius, red_zone_clearance, detonate_delay,
+  detonate_radius, detonate_damage, charge_speed, charge_stun_duration,
+  track_range, attack_release_margin, track_release_margin, deploy_cost,
+  bar_width, hold_duration, patrol_radius, patrol_min_radius, patrol_slack,
+  endpoint_roam_radius, endpoint_idle_min, endpoint_idle_max,
+  endpoint_return_slack_factor, route_corridor, route_variant_count,
+  spawn_offmap_padding, separation_strength, separation_max_push,
+  replan_cooldown, stuck_time, stuck_distance, attack_contact_tolerance,
+  attack_animation_loop, knockback_distance, knockback_duration
+) VALUES (
+  'Aegis',
+  'Aegis',
+  0,
+  0,
+  120,
+  12,
+  120,
+  5,
+  8,
+  1,
+  0,
+  10,
+  1,
+  1,
+  'Aegis',
+  0.272,
+  20.5,
+  19,
+  3000,
+  40,
+  8,
+  240,
+  1000,
+  240,
+  12,
+  16,
+  0,
+  56.5,
+  5000,
+  37.5,
+  15,
+  22.5,
+  187.5,
+  1200,
+  4000,
+  4,
+  38,
+  5,
+  90,
+  1,
+  7.5,
+  700,
+  1000,
+  9.5,
+  2,
+  1,
+  10,
+  500
+);
+INSERT INTO enemy_infantry (
+  unit_id, unit_name, cost, build_time, max_hp, armor, move_speed, action_range,
+  action_value, action_cd, target_type, armor_penetration, squad_size, squad_cap,
+  roster, character_scale, collision_radius, red_zone_clearance, detonate_delay,
+  detonate_radius, detonate_damage, track_range, attack_release_margin,
+  track_release_margin, deploy_cost, bar_width, hold_duration, patrol_radius,
+  patrol_min_radius, patrol_slack, endpoint_roam_radius, endpoint_idle_min,
+  endpoint_idle_max, endpoint_return_slack_factor, route_corridor,
+  route_variant_count, spawn_offmap_padding, separation_strength,
+  separation_max_push, replan_cooldown, stuck_time, stuck_distance,
+  attack_contact_tolerance, attack_animation_loop, knockback_distance,
+  knockback_duration
+) VALUES (
+  'Jaeger',
+  'Jaeger',
+  0,
+  0,
+  60,
+  6,
+  150,
+  450,
+  10,
+  1.5,
+  0,
+  12,
+  1,
+  1,
+  'Jaeger',
+  0.272,
+  20.5,
+  19,
+  3000,
+  40,
+  8,
+  390,
+  12,
+  16,
+  0,
+  56.5,
+  5000,
+  37.5,
+  15,
+  22.5,
+  187.5,
+  1200,
+  4000,
+  4,
+  38,
+  5,
+  90,
+  1,
+  7.5,
+  700,
+  1000,
+  9.5,
+  2,
+  1,
+  10,
+  500
+);
+INSERT INTO enemy_infantry (
+  unit_id, unit_name, cost, build_time, max_hp, armor, move_speed, action_range,
+  action_value, action_cd, target_type, armor_penetration, squad_size, squad_cap,
+  roster, character_scale, collision_radius, red_zone_clearance, detonate_delay,
+  detonate_radius, detonate_damage, track_range, attack_release_margin,
+  track_release_margin, deploy_cost, bar_width, hold_duration, patrol_radius,
+  patrol_min_radius, patrol_slack, endpoint_roam_radius, endpoint_idle_min,
+  endpoint_idle_max, endpoint_return_slack_factor, route_corridor,
+  route_variant_count, spawn_offmap_padding, separation_strength,
+  separation_max_push, replan_cooldown, stuck_time, stuck_distance,
+  attack_contact_tolerance, attack_animation_loop, knockback_distance,
+  knockback_duration
+) VALUES (
+  'Ripper',
+  'Ripper',
+  0,
+  0,
+  80,
+  6,
+  190,
+  150,
+  8,
+  0.6,
+  0,
+  6,
+  1,
+  1,
+  'Ripper',
+  0.272,
+  20.5,
+  19,
+  3000,
+  40,
+  8,
+  240,
+  12,
+  16,
+  0,
+  56.5,
+  5000,
+  37.5,
+  15,
+  22.5,
+  187.5,
+  1200,
+  4000,
+  4,
+  38,
+  5,
+  90,
+  1,
+  7.5,
+  700,
+  1000,
+  9.5,
+  2,
+  1,
+  10,
+  500
+);
+INSERT INTO enemy_infantry (
+  unit_id, unit_name, cost, build_time, max_hp, armor, move_speed, action_range,
+  action_value, action_cd, target_type, armor_penetration, squad_size, squad_cap,
+  roster, character_scale, collision_radius, red_zone_clearance, detonate_delay,
+  detonate_radius, detonate_damage, track_range, attack_release_margin,
+  track_release_margin, deploy_cost, bar_width, hold_duration, patrol_radius,
+  patrol_min_radius, patrol_slack, endpoint_roam_radius, endpoint_idle_min,
+  endpoint_idle_max, endpoint_return_slack_factor, route_corridor,
+  route_variant_count, spawn_offmap_padding, separation_strength,
+  separation_max_push, replan_cooldown, stuck_time, stuck_distance,
+  attack_contact_tolerance, attack_animation_loop, knockback_distance,
+  knockback_duration
+) VALUES (
+  'Prowler',
+  'Prowler',
+  0,
+  0,
+  80,
+  8,
+  190,
+  150,
+  8,
+  1,
+  0,
+  6,
+  1,
+  1,
+  'Prowler',
+  0.272,
+  20.5,
+  19,
+  3000,
+  40,
+  8,
+  240,
+  12,
+  16,
+  0,
+  56.5,
+  5000,
+  37.5,
+  15,
+  22.5,
+  187.5,
+  1200,
+  4000,
+  4,
+  38,
+  5,
+  90,
+  1,
+  7.5,
+  700,
+  1000,
+  9.5,
+  2,
+  1,
+  10,
+  500
+);
+
+
+
+
+
+
+
+-- ----------------------------------------------------------------------------
+-- 我方步兵新兵种（GRF1 分类子菜单）：ELMO1 / GK / ELMO2，数值取自 unit_database.xlsx
+-- （roster 对应各自的 Spine 角色；squad_cap 沿用 JF 的 6，实际受全局小队上限约束）
+-- ----------------------------------------------------------------------------
+INSERT INTO player_infantry (
+  unit_id,
+  unit_name,
+  cost,
+  build_time,
+  max_hp,
+  armor,
+  move_speed,
+  action_range,
+  action_value,
+  action_cd,
+  target_type,
+  armor_penetration,
+  squad_size,
+  squad_cap,
+  roster,
+  character_scale,
+  collision_radius,
+  member_collision_radius,
+  formation_side,
+  red_zone_clearance,
+  member_separation,
+  member_enemy_separation,
+  regen_delay,
+  regen_per_second,
+  detonate_delay,
+  detonate_radius,
+  detonate_damage,
+  detonate_damage_falloff,
+  detonate_falloff_step,
+  charge_speed,
+  charge_trigger_distance,
+  death_tint_duration,
+  death_tint_strength,
+  track_range,
+  attack_release_margin,
+  track_release_margin,
+  deploy_cost,
+  member_separation_max_push,
+  member_anim_max_step,
+  member_return_distance,
+  member_return_exit_ratio,
+  member_return_extra_clearance,
+  member_return_speed,
+  member_return_replan_distance,
+  member_return_waypoint_radius,
+  squad_regroup_arrive,
+  squad_regroup_catchup_distance,
+  squad_regroup_stall_ratio,
+  squad_regroup_stall_frames,
+  squad_free_return_ratio,
+  squad_separation_target,
+  squad_separation_buffer,
+  squad_order_spread,
+  squad_separation_passes,
+  squad_edge_range,
+  squad_edge_exit_range,
+  squad_formation_lerp,
+  squad_morph_duration,
+  squad_free_spread,
+  squad_free_max_distance,
+  squad_free_back_left,
+  squad_free_back_apex,
+  squad_free_back_right,
+  squad_slot_swap_blend,
+  animation_mix_attack,
+  animation_mix_loop,
+  attack_animation_fallback,
+  animation_lock_grace,
+  spawn_animation_duration,
+  spawn_animation_min_scale,
+  red_route_range,
+  red_steer_bias,
+  move_stall_timeout,
+  move_progress_epsilon,
+  charge_retarget_interval,
+  bar_width,
+  shadow_width_ratio,
+  shadow_flatten,
+  shadow_alpha,
+  shadow_offset_y,
+  ring_width,
+  ring_height,
+  ring_offset_y,
+  hold_duration,
+  patrol_radius,
+  patrol_min_radius,
+  patrol_slack,
+  endpoint_roam_radius,
+  endpoint_idle_min,
+  endpoint_idle_max,
+  endpoint_return_slack_factor,
+  route_corridor,
+  route_variant_count,
+  spawn_offmap_padding,
+  separation_strength,
+  separation_max_push,
+  replan_cooldown,
+  stuck_time,
+  stuck_distance,
+  attack_contact_tolerance,
+  attack_animation_loop,
+  knockback_distance,
+  knockback_duration,
+  attack_blast_radius, attack_blast_falloff, attack_blast_falloff_step,
+  attack_projectile_size,
+  attack_while_moving, attack_while_moving_arc,
+  attack_projectile_speed, attack_projectile_launch_ratio, attack_projectile_bone,
+  attack_projectile_muzzle_forward, attack_projectile_muzzle_height,
+  render_parts, death_charge_animation, death_charge_animation_delay,
+  melee_range, melee_animation_name, melee_ignore_armor
+) VALUES (
+  'ELMO1',
+  'ELMO1',
+  45,
+  30,
+  50,
+  8,
+  190,
+  300,
+  6,
+  0.5,
+  0,
+  9,
+  3,
+  4,
+  'Biyoca,Andoris,Groza',
+  0.5625,
+  30,
+  17,
+  56.5,
+  19,
+  19,
+  37.5,
+  5000,
+  0.08,
+  5000,
+  50,
+  25,
+  0.2,
+  10,
+  244,
+  37.5,
+  900,
+  0.25,
+  NULL,
+  NULL,
+  NULL,
+  10,
+  7.5,
+  4.9,
+  112.5,
+  0.5,
+  7.5,
+  262.5,
+  75,
+  7.5,
+  2.8,
+  30,
+  0.25,
+  20,
+  1.15,
+  28,
+  0.05,
+  60,
+  6,
+  11.5,
+  26.5,
+  0.25,
+  560,
+  30,
+  86.5,
+  11.5,
+  -19,
+  7.5,
+  0.97,
+  0.12,
+  0.16,
+  600,
+  20,
+  720,
+  0.3,
+  281.5,
+  0.15,
+  1600,
+  0.95,
+  300,
+  40,
+  0.66,
+  0.27,
+  0.32,
+  2,
+  37.5,
+  17,
+  4,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL
+);
+INSERT INTO player_infantry (
+  unit_id, unit_name, cost, build_time, max_hp, armor, move_speed, action_range,
+  action_value, action_cd, target_type, armor_penetration, squad_size, squad_cap,
+  roster, character_scale, collision_radius, member_collision_radius, formation_side,
+  red_zone_clearance, member_separation, member_enemy_separation, regen_delay,
+  regen_per_second, detonate_delay, detonate_radius, detonate_damage,
+  detonate_damage_falloff, detonate_falloff_step, charge_speed,
+  charge_trigger_distance, death_tint_duration, death_tint_strength, track_range,
+  attack_release_margin, track_release_margin, deploy_cost, member_separation_max_push,
+  member_anim_max_step, member_return_distance, member_return_exit_ratio,
+  member_return_extra_clearance, member_return_speed, member_return_replan_distance,
+  member_return_waypoint_radius, squad_regroup_arrive, squad_regroup_catchup_distance,
+  squad_regroup_stall_ratio, squad_regroup_stall_frames, squad_free_return_ratio,
+  squad_separation_target, squad_separation_buffer, squad_order_spread,
+  squad_separation_passes, squad_edge_range, squad_edge_exit_range,
+  squad_formation_lerp, squad_morph_duration, squad_free_spread,
+  squad_free_max_distance, squad_free_back_left, squad_free_back_apex,
+  squad_free_back_right, squad_slot_swap_blend, animation_mix_attack,
+  animation_mix_loop, attack_animation_fallback, animation_lock_grace,
+  spawn_animation_duration, spawn_animation_min_scale, red_route_range,
+  red_steer_bias, move_stall_timeout, move_progress_epsilon, charge_retarget_interval,
+  bar_width, shadow_width_ratio, shadow_flatten, shadow_alpha, shadow_offset_y,
+  ring_width, ring_height, ring_offset_y, hold_duration, patrol_radius,
+  patrol_min_radius, patrol_slack, endpoint_roam_radius, endpoint_idle_min,
+  endpoint_idle_max, endpoint_return_slack_factor, route_corridor,
+  route_variant_count, spawn_offmap_padding, separation_strength,
+  separation_max_push, replan_cooldown, stuck_time, stuck_distance,
+  attack_contact_tolerance, attack_animation_loop, knockback_distance,
+  knockback_duration,
+  attack_blast_radius, attack_blast_falloff, attack_blast_falloff_step,
+  attack_projectile_size,
+  attack_while_moving, attack_while_moving_arc,
+  attack_projectile_speed, attack_projectile_launch_ratio, attack_projectile_bone,
+  attack_projectile_muzzle_forward, attack_projectile_muzzle_height,
+  render_parts, death_charge_animation, death_charge_animation_delay,
+  melee_range, melee_animation_name, melee_ignore_armor
+) VALUES (
+  'GK',
+  'GK',
+  55,
+  30,
+  55,
+  8,
+  190,
+  330,
+  8,
+  0.5,
+  0,
+  8,
+  3,
+  4,
+  'Centaureissi,Sharkry,Tololo',
+  0.5625,
+  30,
+  17,
+  56.5,
+  19,
+  19,
+  37.5,
+  4000,
+  0.08,
+  5000,
+  50,
+  20,
+  0.2,
+  10,
+  244,
+  37.5,
+  900,
+  0.25,
+  NULL,
+  NULL,
+  NULL,
+  10,
+  7.5,
+  4.9,
+  112.5,
+  0.5,
+  7.5,
+  262.5,
+  75,
+  7.5,
+  2.8,
+  30,
+  0.25,
+  20,
+  1.15,
+  28,
+  0.05,
+  60,
+  6,
+  11.5,
+  26.5,
+  0.25,
+  560,
+  30,
+  86.5,
+  11.5,
+  -19,
+  7.5,
+  0.97,
+  0.12,
+  0.16,
+  600,
+  20,
+  720,
+  0.3,
+  281.5,
+  0.15,
+  1600,
+  0.95,
+  300,
+  42.5,
+  0.66,
+  0.27,
+  0.32,
+  2,
+  37.5,
+  17,
+  4,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL
+);
+INSERT INTO player_infantry (
+  unit_id, unit_name, cost, build_time, max_hp, armor, move_speed, action_range,
+  action_value, action_cd, target_type, armor_penetration, squad_size, squad_cap,
+  roster, character_scale, collision_radius, member_collision_radius, formation_side,
+  red_zone_clearance, member_separation, member_enemy_separation, regen_delay,
+  regen_per_second, detonate_delay, detonate_radius, detonate_damage,
+  detonate_damage_falloff, detonate_falloff_step, charge_speed,
+  charge_trigger_distance, death_tint_duration, death_tint_strength, track_range,
+  attack_release_margin, track_release_margin, deploy_cost, member_separation_max_push,
+  member_anim_max_step, member_return_distance, member_return_exit_ratio,
+  member_return_extra_clearance, member_return_speed, member_return_replan_distance,
+  member_return_waypoint_radius, squad_regroup_arrive, squad_regroup_catchup_distance,
+  squad_regroup_stall_ratio, squad_regroup_stall_frames, squad_free_return_ratio,
+  squad_separation_target, squad_separation_buffer, squad_order_spread,
+  squad_separation_passes, squad_edge_range, squad_edge_exit_range,
+  squad_formation_lerp, squad_morph_duration, squad_free_spread,
+  squad_free_max_distance, squad_free_back_left, squad_free_back_apex,
+  squad_free_back_right, squad_slot_swap_blend, animation_mix_attack,
+  animation_mix_loop, attack_animation_fallback, animation_lock_grace,
+  spawn_animation_duration, spawn_animation_min_scale, red_route_range,
+  red_steer_bias, move_stall_timeout, move_progress_epsilon, charge_retarget_interval,
+  bar_width, shadow_width_ratio, shadow_flatten, shadow_alpha, shadow_offset_y,
+  ring_width, ring_height, ring_offset_y, hold_duration, patrol_radius,
+  patrol_min_radius, patrol_slack, endpoint_roam_radius, endpoint_idle_min,
+  endpoint_idle_max, endpoint_return_slack_factor, route_corridor,
+  route_variant_count, spawn_offmap_padding, separation_strength,
+  separation_max_push, replan_cooldown, stuck_time, stuck_distance,
+  attack_contact_tolerance, attack_animation_loop, knockback_distance,
+  knockback_duration,
+  attack_blast_radius, attack_blast_falloff, attack_blast_falloff_step,
+  attack_projectile_size,
+  attack_while_moving, attack_while_moving_arc,
+  attack_projectile_speed, attack_projectile_launch_ratio, attack_projectile_bone,
+  attack_projectile_muzzle_forward, attack_projectile_muzzle_height,
+  render_parts, death_charge_animation, death_charge_animation_delay,
+  melee_range, melee_animation_name, melee_ignore_armor
+) VALUES (
+  'ELMO2',
+  'ELMO2',
+  45,
+  35,
+  60,
+  6,
+  250,
+  250,
+  8,
+  0.4,
+  0,
+  6,
+  3,
+  3,
+  'Cheeta,Lenna,Soumi',
+  0.5625,
+  30,
+  17,
+  56.5,
+  19,
+  19,
+  37.5,
+  4000,
+  0.1,
+  5000,
+  50,
+  30,
+  0.2,
+  10,
+  260,
+  37.5,
+  900,
+  0.25,
+  NULL,
+  NULL,
+  NULL,
+  10,
+  7.5,
+  4.9,
+  112.5,
+  0.5,
+  7.5,
+  262.5,
+  75,
+  7.5,
+  2.8,
+  30,
+  0.25,
+  20,
+  1.15,
+  28,
+  0.05,
+  60,
+  6,
+  11.5,
+  26.5,
+  0.25,
+  560,
+  30,
+  86.5,
+  11.5,
+  -19,
+  7.5,
+  0.97,
+  0.12,
+  0.16,
+  600,
+  20,
+  720,
+  0.3,
+  281.5,
+  0.15,
+  1600,
+  0.95,
+  300,
+  45,
+  0.66,
+  0.27,
+  0.32,
+  2,
+  37.5,
+  17,
+  4,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL
+);
+
+-- ----------------------------------------------------------------------------
+-- 占位记录：数值尚未设计，只登记「已存在的兵种」与部署扣点。
+-- 出生界面：出兵扣 cost（招募消耗），deploy_cost 只削减每分钟点数上限。
+-- 这两个兵种尚未登记 cost，因此先只入库 deploy_cost；补上 cost 后才会显示招募角标。
+-- 其余列留空（省略），等设计完成后再补。
+-- ----------------------------------------------------------------------------
+INSERT INTO player_heavy (unit_id, unit_name, squad_cap, deploy_cost) VALUES (
+  'tasa_air',
+  'tasa_air',
+  1,
+  30
+);
+
+INSERT INTO player_support (unit_id, unit_name, squad_cap, deploy_cost) VALUES (
+  'mid',
+  'mid',
+  1,
+  20
+);
+INSERT INTO player_support (
+  unit_id, unit_name, cost, build_time, max_hp, armor, move_speed, action_range,
+  action_value, action_cd, target_type, armor_penetration, squad_size, squad_cap,
+  roster, character_scale, collision_radius, member_collision_radius,
+  red_zone_clearance, member_separation, member_enemy_separation, regen_delay,
+  regen_per_second, detonate_delay, detonate_radius, detonate_damage,
+  detonate_damage_falloff, detonate_falloff_step, charge_speed,
+  charge_trigger_distance, death_tint_duration, death_tint_strength, deploy_cost,
+  member_separation_max_push, member_anim_max_step, member_return_distance,
+  member_return_exit_ratio, member_return_extra_clearance, member_return_speed,
+  member_return_replan_distance, member_return_waypoint_radius,
+  squad_regroup_arrive, squad_regroup_catchup_distance,
+  squad_regroup_stall_ratio, squad_regroup_stall_frames, squad_free_return_ratio,
+  squad_separation_target, squad_separation_buffer, squad_order_spread,
+  squad_separation_passes, squad_edge_range, squad_edge_exit_range,
+  squad_formation_lerp, squad_morph_duration, squad_free_spread,
+  squad_free_max_distance, squad_free_back_left, squad_free_back_apex,
+  squad_free_back_right, squad_slot_swap_blend, attack_animation_name,
+  animation_mix_attack, animation_mix_loop, attack_animation_fallback,
+  animation_lock_grace, spawn_animation_duration, spawn_animation_min_scale,
+  red_route_range, red_steer_bias, move_stall_timeout, move_progress_epsilon,
+  charge_retarget_interval, bar_width, shadow_width_ratio, shadow_flatten,
+  shadow_alpha, shadow_offset_y, ring_width, ring_height, ring_offset_y
+) VALUES (
+  'coffee',
+  'coffee',
+  80,
+  40,
+  50,
+  6,
+  150,
+  650,
+  24,
+  2,
+  0,
+  15,
+  2,
+  2,
+  'Macqiato,Nemesis',
+  0.5625,
+  30,
+  17,
+  19,
+  19,
+  37.5,
+  5000,
+  0.08,
+  5000,
+  50,
+  20,
+  0.2,
+  10,
+  180,
+  37.5,
+  900,
+  0.25,
+  15,
+  7.5,
+  4.9,
+  112.5,
+  0.5,
+  7.5,
+  262.5,
+  75,
+  7.5,
+  2.8,
+  30,
+  0.25,
+  20,
+  1.15,
+  28,
+  0.05,
+  60,
+  6,
+  11.5,
+  26.5,
+  0.25,
+  560,
+  30,
+  86.5,
+  11.5,
+  -19,
+  7.5,
+  0.97,
+  'attack',
+  0.12,
+  0.16,
+  600,
+  20,
+  720,
+  0.3,
+  281.5,
+  0.15,
+  1600,
+  0.95,
+  300,
+  37.5,
+  0.66,
+  0.27,
+  0.32,
+  2,
+  37.5,
+  17,
+  4
+);
+INSERT INTO player_support (
+  unit_id, unit_name, cost, build_time, max_hp, armor, move_speed, action_range,
+  action_value, action_cd, target_type, armor_penetration, squad_size, squad_cap,
+  roster, character_scale, collision_radius, member_collision_radius,
+  red_zone_clearance, member_separation, member_enemy_separation, regen_delay,
+  regen_per_second, detonate_delay, detonate_radius, detonate_damage,
+  detonate_damage_falloff, detonate_falloff_step, charge_speed,
+  charge_trigger_distance, death_tint_duration, death_tint_strength, deploy_cost,
+  member_separation_max_push, member_anim_max_step, member_return_distance,
+  member_return_exit_ratio, member_return_extra_clearance, member_return_speed,
+  member_return_replan_distance, member_return_waypoint_radius,
+  squad_regroup_arrive, squad_regroup_catchup_distance,
+  squad_regroup_stall_ratio, squad_regroup_stall_frames, squad_free_return_ratio,
+  squad_separation_target, squad_separation_buffer, squad_order_spread,
+  squad_separation_passes, squad_edge_range, squad_edge_exit_range,
+  squad_formation_lerp, squad_morph_duration, squad_free_spread,
+  squad_free_max_distance, squad_free_back_left, squad_free_back_apex,
+  squad_free_back_right, squad_slot_swap_blend, attack_animation_name,
+  animation_mix_attack, animation_mix_loop, attack_animation_fallback,
+  animation_lock_grace, spawn_animation_duration, spawn_animation_min_scale,
+  red_route_range, red_steer_bias, move_stall_timeout, move_progress_epsilon,
+  charge_retarget_interval, bar_width, shadow_width_ratio, shadow_flatten,
+  shadow_alpha, shadow_offset_y, ring_width, ring_height, ring_offset_y,
+  art_facing_left, summon_animation_name, summon_clone_count, summon_clone_delay
+) VALUES (
+  'SF',
+  'SF',
+  120,
+  40,
+  70,
+  10,
+  200,
+  350,
+  15,
+  0.4,
+  0,
+  10,
+  1,
+  2,
+  'Agent',
+  0.23,
+  30,
+  17,
+  19,
+  19,
+  37.5,
+  5000,
+  0.1,
+  5000,
+  50,
+  20,
+  0.2,
+  10,
+  230,
+  37.5,
+  900,
+  0.25,
+  15,
+  7.5,
+  4.9,
+  112.5,
+  0.5,
+  7.5,
+  262.5,
+  75,
+  7.5,
+  2.8,
+  30,
+  0.25,
+  20,
+  1.15,
+  28,
+  0.05,
+  60,
+  6,
+  11.5,
+  26.5,
+  0.25,
+  560,
+  30,
+  86.5,
+  11.5,
+  -19,
+  7.5,
+  0.97,
+  'attack',
+  0.12,
+  0.16,
+  600,
+  20,
+  720,
+  0.3,
+  281.5,
+  0.15,
+  1600,
+  0.95,
+  300,
+  37.5,
+  0.66,
+  0.27,
+  0.32,
+  2,
+  37.5,
+  17,
+  4,
+  1,
+  'skill2',
+  2,
+  1400
+);
+INSERT INTO player_support (
+  unit_id, unit_name, cost, build_time, max_hp, armor, move_speed, action_range,
+  action_value, action_cd, target_type, armor_penetration, squad_size, squad_cap,
+  roster, character_scale, collision_radius, member_collision_radius,
+  red_zone_clearance, member_separation, member_enemy_separation, regen_delay,
+  regen_per_second, detonate_delay, detonate_radius, detonate_damage,
+  detonate_damage_falloff, detonate_falloff_step, charge_speed,
+  charge_trigger_distance, death_tint_duration, death_tint_strength, deploy_cost,
+  member_separation_max_push, member_anim_max_step, member_return_distance,
+  member_return_exit_ratio, member_return_extra_clearance, member_return_speed,
+  member_return_replan_distance, member_return_waypoint_radius,
+  squad_regroup_arrive, squad_regroup_catchup_distance,
+  squad_regroup_stall_ratio, squad_regroup_stall_frames, squad_free_return_ratio,
+  squad_separation_target, squad_separation_buffer, squad_order_spread,
+  squad_separation_passes, squad_edge_range, squad_edge_exit_range,
+  squad_formation_lerp, squad_morph_duration, squad_free_spread,
+  squad_free_max_distance, squad_free_back_left, squad_free_back_apex,
+  squad_free_back_right, squad_slot_swap_blend, attack_animation_name,
+  animation_mix_attack, animation_mix_loop, attack_animation_fallback,
+  animation_lock_grace, spawn_animation_duration, spawn_animation_min_scale,
+  red_route_range, red_steer_bias, move_stall_timeout, move_progress_epsilon,
+  charge_retarget_interval, bar_width, shadow_width_ratio, shadow_flatten,
+  shadow_alpha, shadow_offset_y, ring_width, ring_height, ring_offset_y
+) VALUES (
+  '404',
+  404,
+  100,
+  40,
+  80,
+  10,
+  260,
+  350,
+  10,
+  0.5,
+  0,
+  10,
+  2,
+  2,
+  'Clukay,Mishty',
+  0.5625,
+  30,
+  17,
+  19,
+  19,
+  37.5,
+  4000,
+  0.15,
+  5000,
+  50,
+  20,
+  0.2,
+  10,
+  260,
+  37.5,
+  900,
+  0.25,
+  15,
+  7.5,
+  4.9,
+  112.5,
+  0.5,
+  7.5,
+  262.5,
+  75,
+  7.5,
+  2.8,
+  30,
+  0.25,
+  20,
+  1.15,
+  28,
+  0.05,
+  60,
+  6,
+  11.5,
+  26.5,
+  0.25,
+  560,
+  30,
+  86.5,
+  11.5,
+  -19,
+  7.5,
+  0.97,
+  'attack',
+  0.12,
+  0.16,
+  600,
+  20,
+  720,
+  0.3,
+  281.5,
+  0.15,
+  1600,
+  0.95,
+  300,
+  37.5,
+  0.66,
+  0.27,
+  0.32,
+  2,
+  37.5,
+  17,
+  4
+);
+
+
+
+
+-- 我方重甲单位（RS 分类子菜单）：TankM1 / Ares / Warjack，占位出兵（美术后续接入）
+-- TankM1：我方重装单位（单兵编队），Spine 角色 TankM1_1001（骨架 428×201，按 0.528
+-- 实际显示约 226×106 像素；碰撞体半径 90 与显示尺寸一致，净空 65 防止车身压进屏蔽区）。
+-- 攻击动画用 skill1（时长约 2.53s，攻击间隔 2.8s 让动作完整播完）；死亡沿用步兵的自爆/冲锋链路
+INSERT INTO player_heavy (
+  unit_id, unit_name, cost, build_time, max_hp, armor, move_speed, action_range,
+  action_value, action_cd, target_type, armor_penetration, squad_size, squad_cap,
+  roster, character_scale, collision_radius, member_collision_radius, formation_side,
+  red_zone_clearance, member_separation, member_enemy_separation, regen_delay,
+  regen_per_second, detonate_delay, detonate_radius, detonate_damage,
+  detonate_damage_falloff, detonate_falloff_step, charge_speed,
+  charge_trigger_distance, death_tint_duration, death_tint_strength, track_range,
+  attack_release_margin, track_release_margin, deploy_cost, member_separation_max_push,
+  member_anim_max_step, member_return_distance, member_return_exit_ratio,
+  member_return_extra_clearance, member_return_speed, member_return_replan_distance,
+  member_return_waypoint_radius, squad_regroup_arrive, squad_regroup_catchup_distance,
+  squad_regroup_stall_ratio, squad_regroup_stall_frames, squad_free_return_ratio,
+  squad_separation_target, squad_separation_buffer, squad_order_spread,
+  squad_separation_passes, squad_edge_range, squad_edge_exit_range,
+  squad_formation_lerp, squad_morph_duration, squad_free_spread,
+  squad_free_max_distance, squad_free_back_left, squad_free_back_apex,
+  squad_free_back_right, squad_slot_swap_blend, attack_animation_name,
+  animation_mix_attack, animation_mix_loop, attack_animation_fallback,
+  animation_lock_grace, spawn_animation_duration, spawn_animation_min_scale,
+  red_route_range, red_steer_bias, move_stall_timeout, move_progress_epsilon,
+  charge_retarget_interval, bar_width, shadow_width_ratio, shadow_flatten,
+  shadow_alpha, shadow_offset_y, ring_width, ring_height, ring_offset_y,
+  hold_duration, patrol_radius, patrol_min_radius, patrol_slack,
+  endpoint_roam_radius, endpoint_idle_min, endpoint_idle_max,
+  endpoint_return_slack_factor, route_corridor, route_variant_count,
+  spawn_offmap_padding, separation_strength, separation_max_push,
+  replan_cooldown, stuck_time, stuck_distance, attack_contact_tolerance,
+  attack_animation_loop, knockback_distance, knockback_duration,
+  attack_blast_radius, attack_blast_falloff, attack_blast_falloff_step,
+  attack_projectile_size,
+  attack_while_moving, attack_while_moving_arc,
+  attack_projectile_speed, attack_projectile_launch_ratio, attack_projectile_bone,
+  attack_projectile_muzzle_forward, attack_projectile_muzzle_height,
+  render_parts, death_charge_animation, death_charge_animation_delay,
+  melee_range, melee_animation_name, melee_ignore_armor
+) VALUES (
+  'TankM1',
+  'TankM1',
+  200,
+  60,
+  170,
+  10,
+  240,
+  450,
+  70,
+  2.8,
+  0,
+  20,
+  1,
+  2,
+  'TankM1_1001',
+  0.528,
+  90,
+  90,
+  NULL,
+  65,
+  NULL,
+  110.5,
+  10000,
+  0.05,
+  5000,
+  100,
+  80,
+  0.1,
+  10,
+  260,
+  90,
+  900,
+  0.25,
+  NULL,
+  NULL,
+  NULL,
+  30,
+  7.5,
+  4.9,
+  112.5,
+  0.5,
+  7.5,
+  262.5,
+  75,
+  7.5,
+  2.8,
+  30,
+  0.25,
+  20,
+  1.15,
+  28,
+  0.05,
+  60,
+  6,
+  11.5,
+  26.5,
+  0.25,
+  560,
+  30,
+  86.5,
+  0,
+  0,
+  0,
+  1,
+  'skill1',
+  0.25,
+  0.16,
+  2600,
+  40,
+  720,
+  0.3,
+  281.5,
+  0.15,
+  1600,
+  0.95,
+  300,
+  120,
+  0.66,
+  0.27,
+  0.32,
+  2,
+  140,
+  60,
+  6,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  80,
+  0.2,
+  10,
+  20,
+  1,
+  60,
+  1200,
+  0.1,
+  'muzzle',
+  70,
+  60,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL
+);
+INSERT INTO player_heavy (
+  unit_id, unit_name, cost, build_time, max_hp, armor, move_speed, action_range,
+  action_value, action_cd, target_type, armor_penetration, squad_size, squad_cap,
+  roster, character_scale, collision_radius, member_collision_radius,
+  red_zone_clearance, member_enemy_separation, regen_delay, regen_per_second,
+  detonate_delay, detonate_radius, detonate_damage, detonate_damage_falloff,
+  detonate_falloff_step, charge_speed, charge_trigger_distance,
+  death_tint_duration, death_tint_strength, deploy_cost,
+  member_separation_max_push, member_anim_max_step, member_return_distance,
+  member_return_exit_ratio, member_return_extra_clearance, member_return_speed,
+  member_return_replan_distance, member_return_waypoint_radius,
+  squad_regroup_arrive, squad_regroup_catchup_distance,
+  squad_regroup_stall_ratio, squad_regroup_stall_frames, squad_free_return_ratio,
+  squad_separation_target, squad_separation_buffer, squad_order_spread,
+  squad_separation_passes, squad_edge_range, squad_edge_exit_range,
+  squad_formation_lerp, squad_morph_duration, squad_free_spread,
+  squad_free_max_distance, squad_free_back_left, squad_free_back_apex,
+  squad_free_back_right, squad_slot_swap_blend, attack_animation_name,
+  animation_mix_attack, animation_mix_loop, attack_animation_fallback,
+  animation_lock_grace, spawn_animation_duration, spawn_animation_min_scale,
+  red_route_range, red_steer_bias, move_stall_timeout, move_progress_epsilon,
+  charge_retarget_interval, bar_width, shadow_width_ratio, shadow_flatten,
+  shadow_alpha, shadow_offset_y, ring_width, ring_height, ring_offset_y,
+  attack_blast_radius, attack_blast_falloff, attack_blast_falloff_step,
+  attack_projectile_size, attack_while_moving, attack_facing_required, attack_projectile_speed,
+  attack_projectile_launch_ratio, attack_projectile_bone,
+  render_parts, death_charge_animation, death_charge_animation_delay,
+  melee_range, melee_animation_name, melee_ignore_armor, art_facing_left
+) VALUES (
+  'Ares',
+  'Ares',
+  220,
+  60,
+  150,
+  10,
+  210,
+  350,
+  40,
+  1,
+  0,
+  15,
+  1,
+  1,
+  'Ares',
+  0.38,
+  90,
+  90,
+  65,
+  110.5,
+  10000,
+  0.05,
+  5000,
+  100,
+  60,
+  0.1,
+  10,
+  260,
+  90,
+  900,
+  0.25,
+  30,
+  7.5,
+  4.9,
+  112.5,
+  0.5,
+  7.5,
+  262.5,
+  75,
+  7.5,
+  2.8,
+  30,
+  0.25,
+  20,
+  1.15,
+  28,
+  0.05,
+  60,
+  6,
+  11.5,
+  26.5,
+  0.25,
+  560,
+  30,
+  86.5,
+  0,
+  0,
+  0,
+  1,
+  'attack',
+  0.25,
+  0.16,
+  2600,
+  40,
+  720,
+  0.3,
+  281.5,
+  0.15,
+  1600,
+  0.95,
+  400,
+  120,
+  0.66,
+  0.27,
+  0.32,
+  2,
+  140,
+  60,
+  6,
+  20,
+  0.2,
+  10,
+  10,
+  0,
+  1,
+  1800,
+  0.1,
+  'muzzle1,muzzle2',
+  NULL,
+  'skill3',
+  0,
+  NULL,
+  NULL,
+  NULL,
+  1
+);
+INSERT INTO player_heavy (
+  unit_id, unit_name, cost, build_time, max_hp, armor, move_speed, action_range,
+  action_value, action_cd, target_type, armor_penetration, squad_size, squad_cap,
+  roster, character_scale, collision_radius, member_collision_radius,
+  red_zone_clearance, member_enemy_separation, regen_delay, regen_per_second,
+  detonate_delay, detonate_radius, detonate_damage, detonate_damage_falloff,
+  detonate_falloff_step, charge_speed, charge_trigger_distance,
+  death_tint_duration, death_tint_strength, deploy_cost,
+  member_separation_max_push, member_anim_max_step, member_return_distance,
+  member_return_exit_ratio, member_return_extra_clearance, member_return_speed,
+  member_return_replan_distance, member_return_waypoint_radius,
+  squad_regroup_arrive, squad_regroup_catchup_distance,
+  squad_regroup_stall_ratio, squad_regroup_stall_frames, squad_free_return_ratio,
+  squad_separation_target, squad_separation_buffer, squad_order_spread,
+  squad_separation_passes, squad_edge_range, squad_edge_exit_range,
+  squad_formation_lerp, squad_morph_duration, squad_free_spread,
+  squad_free_max_distance, squad_free_back_left, squad_free_back_apex,
+  squad_free_back_right, squad_slot_swap_blend, attack_animation_name,
+  animation_mix_attack, animation_mix_loop, attack_animation_fallback,
+  animation_lock_grace, spawn_animation_duration, spawn_animation_min_scale,
+  red_route_range, red_steer_bias, move_stall_timeout, move_progress_epsilon,
+  charge_retarget_interval, bar_width, shadow_width_ratio, shadow_flatten,
+  shadow_alpha, shadow_offset_y, ring_width, ring_height, ring_offset_y,
+  attack_projectile_size, attack_while_moving, attack_facing_required, attack_projectile_speed,
+  attack_projectile_launch_ratio, attack_projectile_bone,
+  render_parts, death_charge_animation, death_charge_animation_delay,
+  melee_range, melee_animation_name, melee_ignore_armor
+) VALUES (
+  'Warjack',
+  'Warjack',
+  220,
+  60,
+  150,
+  10,
+  220,
+  350,
+  30,
+  0.2,
+  0,
+  10,
+  1,
+  1,
+  'Warjack',
+  0.528,
+  90,
+  90,
+  65,
+  110.5,
+  10000,
+  0.05,
+  5000,
+  100,
+  60,
+  0.1,
+  10,
+  260,
+  90,
+  900,
+  0.25,
+  30,
+  7.5,
+  4.9,
+  112.5,
+  0.5,
+  7.5,
+  262.5,
+  75,
+  7.5,
+  2.8,
+  30,
+  0.25,
+  20,
+  1.15,
+  28,
+  0.05,
+  60,
+  6,
+  11.5,
+  26.5,
+  0.25,
+  560,
+  30,
+  86.5,
+  0,
+  0,
+  0,
+  1,
+  'attack',
+  0.25,
+  0.16,
+  2600,
+  40,
+  720,
+  0.3,
+  281.5,
+  0.15,
+  1600,
+  0.95,
+  300,
+  120,
+  0.66,
+  0.27,
+  0.32,
+  2,
+  140,
+  60,
+  6,
+  5,
+  0,
+  1,
+  1500,
+  0.1,
+  'muzzle',
+  'Warjack_1009_Part2, Warjack_1009_Part1',
+  NULL,
+  NULL,
+  5,
+  'attack_SP',
+  1
+);
+
+-- 我方雇佣单位（tasa_air 分类子菜单）：GustafAssist2。
+-- 16lab 占位出兵已移除；coffee / SF 已迁移到 player_support 表（我方支援单位，与 404 同表），此处不再登记
+INSERT INTO player_merc (
+  unit_id, unit_name, action_range, action_value, action_cd, target_type,
+  armor_penetration, roster, character_scale, member_collision_radius,
+  attack_animation_name, attack_blast_radius, attack_blast_falloff,
+  attack_blast_falloff_step, attack_projectile_size, attack_projectile_speed,
+  attack_projectile_launch_ratio, attack_projectile_bone,
+  attack_projectile_muzzle_forward, attack_projectile_muzzle_height
+) VALUES (
+  'GustafAssist2',
+  'GustafAssist2',
+  2000,
+  270,
+  30,
+  0,
+  10,
+  'GustafAssist2',
+  0.3,
+  200,
+  'attack',
+  200,
+  0.1,
+  10,
+  50,
+  1400,
+  0.3,
+  'muzzle',
+  70,
+  60
+);
+
+-- ----------------------------------------------------------------------------
+-- 示例查询
+-- ----------------------------------------------------------------------------
+-- 查看我方步兵所有字段：SELECT * FROM player_infantry;
+-- 查看各兵种的部署扣点：SELECT unit_id, deploy_cost FROM player_infantry UNION ALL SELECT unit_id, deploy_cost FROM player_heavy UNION ALL SELECT unit_id, deploy_cost FROM player_support;
+-- 一眼对比双方现役步兵的表格字段：
+--   SELECT unit_id, cost, build_time, max_hp, armor, move_speed, action_range,
+--          action_value, action_cd, target_type, armor_penetration
+--   FROM player_infantry
+--   UNION ALL
+--   SELECT unit_id, cost, build_time, max_hp, armor, move_speed, action_range,
+--          action_value, action_cd, target_type, armor_penetration
+--   FROM enemy_infantry;
+-- 按破甲/护甲关系核对伤害（破甲 ≥ 护甲：等额 + 每多 1 点 +10%；破甲 < 护甲：每少 1 点 -10%）：
+--   SELECT a.unit_id AS attacker, d.unit_id AS defender,
+--          a.action_value * (1 + 0.1 * (a.armor_penetration - d.armor)) AS damage
+--   FROM player_infantry a CROSS JOIN enemy_infantry d;
