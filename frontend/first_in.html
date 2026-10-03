@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>守护番茄镇 - 开始游戏 | 免费在线RTS网页游戏</title>
+  <meta name="description" content="点击开始进入守护番茄镇：免费即时战略网页游戏，指挥步兵、重装机甲与支援小队，在 8 分钟内守住 10 个番茄。">
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='14.8' y='4' width='2.4' height='6' rx='1' fill='%232f7a3a'/%3E%3Cellipse cx='16' cy='10' rx='7' ry='3' fill='%233f9b4f'/%3E%3Ccircle cx='16' cy='19' r='11' fill='%23e8402a'/%3E%3Cellipse cx='12' cy='16' rx='4' ry='2.5' fill='%23ff6b52'/%3E%3C/svg%3E">
+  <script src="js/phaser.min.js"></script>
+  <script src="js/SpinePlugin.min.js"></script>
+  <style>
+    body {
+      margin: 0;
+      background: #0d1117;
+      overflow: hidden;
+    }
+    canvas {
+      display: block;
+    }
+  </style>
+</head>
+<body>
+
+<!-- 加载进度屏：bg.jpg 全屏背景 + 页面下方进度条，资源加载完成后由 preload 的 complete 事件隐藏 -->
+<div id="loadingScreen" style="position:fixed; left:0; top:0; right:0; bottom:0; z-index:50; background:#0d1117 url('./bg.jpg') center/cover no-repeat;">
+  <div style="position:absolute; left:50%; bottom:7%; transform:translateX(-50%); width:min(640px, 72vw); text-align:center; font-family:'Segoe UI', 'Microsoft YaHei', sans-serif;">
+    <div id="loadProgressText" style="color:#ffffff; font-size:18px; letter-spacing:3px; text-shadow:0 2px 6px rgba(0,0,0,0.6); margin-bottom:10px;">加载中 0%</div>
+    <div style="height:14px; border-radius:8px; background:rgba(13,17,23,0.72); border:1px solid rgba(159,227,255,0.5); overflow:hidden; box-shadow:0 4px 14px rgba(0,0,0,0.45);">
+      <div id="loadProgressFill" style="width:0%; height:100%; border-radius:8px; background:linear-gradient(90deg, #27ae60, #2ecc71); transition:width 0.15s ease-out;"></div>
+    </div>
+  </div>
+</div>
+
+<!-- 背景音乐开关（屏幕右上角常驻）：默认开启，点击切换背景音乐的播放与静音 -->
+<div id="musicNoteButton" title="背景音乐开关" style="position:fixed; top:16px; right:16px; width:44px; height:44px; border-radius:50%; background:rgba(51,55,61,0.92); border:2px solid rgba(159,227,255,0.55); color:#ffd93d; font-size:26px; line-height:40px; text-align:center; cursor:pointer; user-select:none; z-index:10;">&#9834;</div>
+
+<script>
+  // 禁用浏览器右键菜单
+  document.addEventListener('contextmenu', event => event.preventDefault());
+
+  // ----------------------------------------------------
+  // 游戏主页面（first_in.html）：启动游戏后先进入本页面。
+  //   - 背景采用 bg.jpg（4096×2304，与 1920×1080 视野同比例，等比铺满）
+  //   - 图片上方中间偏下位置：彩虹拱幅条；屏幕中间：五个大字艺术标题「守护番茄镇」
+  //   - 图片下方中间偏上位置：两个圆角入口按钮——
+  //       「新手关」点击进入 WG.html（新手关卡）
+  //       「雪　暴」点击进入 WG2.html（雪暴关卡）
+  //   - 图片下方左右空余位置：JF / elmo1 / GK 三支小队（与出兵按钮生成的单位一致）
+  //     自由待机游走，移动范围限制在图片下半部分与整个显示区域内，不可控制
+  // ----------------------------------------------------
+  const config = {
+    type: Phaser.AUTO,
+    width: 1920,
+    height: 1080,
+    backgroundColor: '#0d1117',
+    scale: {
+      mode: Phaser.Scale.FIT,
+      width: 1920,
+      height: 1080,
+      autoCenter: Phaser.Scale.CENTER_BOTH
+    },
+    plugins: {
+      scene: [
+        {
+          key: 'SpinePlugin',
+          plugin: window.SpinePlugin,
+          mapping: 'spine'
+        }
+      ]
+    },
+    scene: { preload, create, update }
+  };
+
+  new Phaser.Game(config);
+
+  // 与 WG.html 出兵按钮（JF / elmo1 / GK）对应的三支小队：花名册末位为队长。
+  // zone 是每支小队的游走区域（x0..x1 横向、y0..y1 纵向，全部落在图片下半部分内）
+  const MENU_SQUADS = [
+    { roster: ['Jiangyu', 'Qiongjiu', 'Daiyan'],     zone: { x0: 80,   x1: 500,  y0: 600, y1: 1020 } },
+    { roster: ['Centaureissi', 'Sharkry', 'Tololo'], zone: { x0: 520,  x1: 940,  y0: 740, y1: 1020 } },
+    { roster: ['Biyoca', 'Andoris', 'Groza'],        zone: { x0: 1300, x1: 1840, y0: 600, y1: 1020 } }
+  ];
+  // 队员渲染缩放：人形按骨架原始尺寸渲染（不缩放，朝向镜像在 update 里翻转）
+  const MENU_UNIT_SCALE = 1;
+  // 三角阵初始站位（与游戏内小队一致：队长在最上、两翼在后方）
+  const MENU_TRIANGLE_OFFSETS = [{ x: 0, y: -65 }, { x: -56.5, y: 28.25 }, { x: 56.5, y: 28.25 }];
+  // 游走速度区间（像素/秒）与待机时长区间（毫秒）
+  const MENU_WALK_SPEED_MIN = 38;
+  const MENU_WALK_SPEED_MAX = 62;
+  const MENU_IDLE_MIN = 900;
+  const MENU_IDLE_MAX = 2600;
+
+  // 与 WG.html 同款运行时兼容处理：tr_ar 系骨架是 Spine 3.8.75 导出，
+  // 内置 SpinePlugin 的版本校验会误判「3.8.75」为不受支持，先归一化成 3.8
+  function normalizeSpineVersionTags(scene) {
+    ['Jiangyu', 'Qiongjiu', 'Daiyan',
+     'Biyoca', 'Andoris', 'Groza',
+     'Centaureissi', 'Sharkry', 'Tololo'].forEach((key) => {
+      const spineJson = scene.cache.json.get(key);
+      if (spineJson && spineJson.skeleton && spineJson.skeleton.spine === '3.8.75') {
+        spineJson.skeleton.spine = '3.8';
+      }
+    });
+  }
+
+  function preload() {
+    // 加载进度接线：progress 更新底部进度条与百分比文字，complete 隐藏加载屏
+    this.load.on('progress', value => {
+      const fill = document.getElementById('loadProgressFill');
+      const label = document.getElementById('loadProgressText');
+      if (fill) fill.style.width = Math.round(value * 100) + '%';
+      if (label) label.textContent = '加载中 ' + Math.round(value * 100) + '%';
+    });
+    this.load.on('complete', () => {
+      const overlay = document.getElementById('loadingScreen');
+      if (overlay) overlay.style.display = 'none';
+    });
+    this.load.image('menuBg', './bg.jpg');
+    MENU_SQUADS.forEach(squad => {
+      squad.roster.forEach(key => {
+        const dir = {
+          Jiangyu: '../art/tr_ar/Jiangyu/', Qiongjiu: '../art/tr_ar/Qiongjiu/', Daiyan: '../art/tr_ar/Daiyan/',
+          Biyoca: '../art/tr_ar/Biyoca/', Andoris: '../art/tr_ar/Andoris/', Groza: '../art/tr_ar/Groza/',
+          Centaureissi: '../art/tr_ar/Centaureissi/', Sharkry: '../art/tr_ar/Sharkry/', Tololo: '../art/tr_ar/Tololo/'
+        }[key];
+        this.load.spine({ key, jsonURL: dir + key + '.json', atlasURL: [dir + key + '.atlas'], preMultipliedAlpha: false });
+        this.load.image(key + ':' + key + '.png', dir + key + '.png');
+      });
+    });
+  }
+
+  function create() {
+    normalizeSpineVersionTags(this);
+
+    // 背景图：等比 cover 铺满 1920×1080（4096×2304 与视野同比例，实际正好 0.46875 倍整铺）
+    const bg = this.add.image(960, 540, 'menuBg').setDepth(0);
+    bg.setScale(Math.max(1920 / bg.width, 1080 / bg.height));
+
+    // 彩虹条：与 index.html 落地页同款的六色横向渐变圆角条，挂在标题下方。
+    // 用 Memory Canvas 画 2 倍分辨率的渐变圆角条（含投影），缩放后依然清晰
+    const barCanvas = document.createElement('canvas');
+    barCanvas.width = 1080;
+    barCanvas.height = 44;
+    const barCtx = barCanvas.getContext('2d');
+    const barGradient = barCtx.createLinearGradient(20, 0, 1060, 0);
+    ['#ff4d4d', '#ff9f43', '#ffd93d', '#6bcb77', '#4d96ff', '#9b59b6'].forEach((color, index) => {
+      barGradient.addColorStop(index / 5, color);
+    });
+    barCtx.shadowColor = 'rgba(0,0,0,0.45)';
+    barCtx.shadowBlur = 12;
+    barCtx.shadowOffsetY = 6;
+    barCtx.fillStyle = barGradient;
+    const barRadius = 12;
+    barCtx.beginPath();
+    barCtx.moveTo(20 + barRadius, 8);
+    barCtx.arcTo(1060, 8, 1060, 28, barRadius);
+    barCtx.arcTo(1060, 28, 20, 28, barRadius);
+    barCtx.arcTo(20, 28, 20, 8, barRadius);
+    barCtx.arcTo(20, 8, 1060, 8, barRadius);
+    barCtx.closePath();
+    barCtx.fill();
+    this.textures.addCanvas('rainbowBarTexture', barCanvas);
+    this.add.image(960, 592, 'rainbowBarTexture').setDisplaySize(540, 22).setDepth(5);
+
+    // 艺术字标题：五个大字直接挂在屏幕中间（白字深描边 + 投影）
+    this.add.text(960, 480, '守护番茄镇', {
+      fontFamily: '"Microsoft YaHei", "SimHei", sans-serif',
+      fontSize: '150px',
+      fontStyle: 'bold',
+      color: '#ffffff',
+      stroke: '#20232a',
+      strokeThickness: 12,
+      shadow: { offsetX: 0, offsetY: 8, color: 'rgba(0,0,0,0.45)', blur: 10, fill: true }
+    }).setOrigin(0.5).setDepth(6);
+
+    // 入口按钮（图片下方中间偏上）：两个圆角长方形按钮——
+    //   「新手关」进入 WG.html（绿色），「雪暴」进入 WG2.html（冰雪蓝）。
+    //   悬停高亮，点击跳转对应游戏页面
+    const menuButtons = [
+      { label: '新手关', target: './WG.html',  base: 0x27ae60, hover: 0x2ecc71,
+        x: 690, y: 840, w: 250, h: 84, r: 20 },
+      { label: '雪　暴', target: './WG2.html', base: 0x2f6f9f, hover: 0x3f8fc7,
+        x: 980, y: 840, w: 250, h: 84, r: 20 }
+    ];
+    const buttonGraphics = this.add.graphics().setDepth(6);
+    const drawMenuButton = (button, hovered) => {
+      buttonGraphics.fillStyle(hovered ? button.hover : button.base, 1);
+      buttonGraphics.fillRoundedRect(button.x, button.y, button.w, button.h, button.r);
+      buttonGraphics.lineStyle(3, 0xffffff, hovered ? 0.95 : 0.7);
+      buttonGraphics.strokeRoundedRect(button.x, button.y, button.w, button.h, button.r);
+    };
+    menuButtons.forEach(button => {
+      drawMenuButton(button, false);
+      this.add.text(button.x + button.w / 2, button.y + button.h / 2, button.label, {
+        fontFamily: '"Microsoft YaHei", "SimHei", sans-serif',
+        fontSize: '40px',
+        fontStyle: 'bold',
+        color: '#ffffff'
+      }).setOrigin(0.5).setDepth(7);
+      const zone = this.add.zone(
+        button.x + button.w / 2,
+        button.y + button.h / 2,
+        button.w, button.h
+      ).setOrigin(0.5).setInteractive({ useHandCursor: true }).setDepth(8);
+      zone.on('pointerover', () => drawMenuButton(button, true));
+      zone.on('pointerout', () => drawMenuButton(button, false));
+      zone.on('pointerup', () => {
+        window.location.href = button.target;   // 进入对应游戏页面
+      });
+    });
+
+    // 三支不可控小队：按三角阵展开到各自游走区域，逐帧随机挑目标自由待机
+    menuUnits = [];
+    let memberIndex = 0;
+    MENU_SQUADS.forEach(squad => {
+      const baseX = (squad.zone.x0 + squad.zone.x1) / 2;
+      const baseY = Phaser.Math.Clamp((squad.zone.y0 + squad.zone.y1) / 2, squad.zone.y0, squad.zone.y1);
+      squad.roster.forEach((key, index) => {
+        const offset = MENU_TRIANGLE_OFFSETS[index % MENU_TRIANGLE_OFFSETS.length];
+        const startX = Phaser.Math.Clamp(baseX + offset.x, squad.zone.x0, squad.zone.x1);
+        const startY = Phaser.Math.Clamp(baseY + offset.y, squad.zone.y0, squad.zone.y1);
+        const spine = this.add.spine(startX, startY, key, 'wait', true);
+        spine.setScale(MENU_UNIT_SCALE);
+        spine.setDepth(4);
+        menuUnits.push({
+          spine,
+          zone: squad.zone,
+          scale: MENU_UNIT_SCALE,
+          state: 'idle',
+          speed: Phaser.Math.Between(MENU_WALK_SPEED_MIN, MENU_WALK_SPEED_MAX),
+          // 错峰起跑：三支小队不会同时迈步
+          waitUntil: performance.now() + 600 + memberIndex * 420,
+          targetX: startX,
+          targetY: startY
+        });
+        memberIndex += 1;
+      });
+    });
+  }
+
+  // 游走中的队员（预填充在 create 里，逐帧推进）
+  let menuUnits = [];
+
+  // 逐帧推进自由待机：待机到点 → 在自己区域内随机挑目标走过去（move 循环 + 朝向镜像）→
+  // 到位后切回待机（wait 循环）。没有输入监听，单位不可控制
+  function update(time, delta) {
+    const step = Math.min(50, delta) / 1000;
+    menuUnits.forEach(unit => {
+      if (unit.state === 'walk') {
+        const dx = unit.targetX - unit.spine.x;
+        const dy = unit.targetY - unit.spine.y;
+        const distance = Math.hypot(dx, dy);
+        const move = unit.speed * step;
+        if (distance <= move) {
+          unit.spine.setPosition(unit.targetX, unit.targetY);
+          unit.state = 'idle';
+          unit.waitUntil = time + Phaser.Math.Between(MENU_IDLE_MIN, MENU_IDLE_MAX);
+          unit.spine.setAnimation(0, 'wait', true);
+        } else {
+          unit.spine.x += dx / distance * move;
+          unit.spine.y += dy / distance * move;
+          const facing = dx < 0 ? -unit.scale : unit.scale;
+          if (unit.spine.scaleX !== facing) unit.spine.setScale(facing, unit.scale);
+        }
+      } else if (time >= unit.waitUntil) {
+        unit.targetX = Phaser.Math.Between(unit.zone.x0, unit.zone.x1);
+        unit.targetY = Phaser.Math.Between(unit.zone.y0, unit.zone.y1);
+        unit.state = 'walk';
+        unit.spine.setAnimation(0, 'move', true);
+      }
+    });
+  }
+  </script>
+
+<script>
+  // 背景音乐播放器（HTML5 Audio，播放列表循环）：默认开启，右上角音符按钮可关闭。
+  // 浏览器自动播放策略下需要一次用户交互才真正出声。主页面曲目：13X-Ray_phase1。
+  window.__TomatoBGM = (function () {
+    const PLAYLIST = [
+      './RTS/13X-Ray_phase1.mp3'
+    ];
+    let audio = null;          // 播放器实例（复用同一个 Audio，切曲只换 src）
+    let trackIndex = 0;
+    let on = true;             // 用户开关（默认开启）
+    let userVolume = 0.8;      // 预留音量控制（0~1）
+    let errorStreak = 0;       // 连续切曲失败计数：整张列表全失败时停止重试，防死循环
+    const MASTER_LEVEL = 0.55; // 音乐基础电平
+    function currentVolume() {
+      return Math.max(0, Math.min(1, on ? userVolume * MASTER_LEVEL : 0));
+    }
+    function nextTrack() {
+      trackIndex = (trackIndex + 1) % PLAYLIST.length;
+      audio.src = PLAYLIST[trackIndex];
+      audio.play().catch(() => {});
+    }
+    function ensureAudio() {
+      if (audio) return;
+      audio = new Audio(PLAYLIST[trackIndex]);
+      audio.volume = currentVolume();
+      // 单曲播完自动切到列表下一首（末尾回卷，形成循环歌单）
+      audio.addEventListener('ended', () => {
+        errorStreak = 0;
+        nextTrack();
+      });
+      // 加载/解码失败不再静默死掉：跳到下一首重试；整张列表连续失败则等待下次交互
+      audio.addEventListener('error', () => {
+        errorStreak += 1;
+        if (!on || errorStreak >= PLAYLIST.length) return;
+        nextTrack();
+      });
+      audio.addEventListener('playing', () => { errorStreak = 0; });
+    }
+    function start() {
+      ensureAudio();
+      errorStreak = 0;
+      audio.volume = currentVolume();
+      const promise = audio.play();
+      if (promise && promise.catch) promise.catch(() => {});   // 自动播放被拦时静默，等 kick 唤醒
+    }
+    return {
+      // 切换开关：返回切换后的状态（true = 开）。关闭即暂停（再开从暂停处续播）
+      toggle() {
+        on = !on;
+        if (on) start();
+        else if (audio) audio.pause();
+        return on;
+      },
+      setVolume(value) {
+        userVolume = Math.max(0, Math.min(1, Number(value) || 0));
+        if (audio) audio.volume = currentVolume();
+      },
+      isOn() { return on; },
+      isPlaying() { return !!(audio && !audio.paused && !audio.ended); },
+      currentTrack() { return PLAYLIST[trackIndex]; },
+      // 首次用户交互时唤醒（自动播放策略）
+      kick() { if (on) start(); }
+    };
+  })();
+  // 默认开启：页面加载即尝试起播；被自动播放策略拦住时，第一次点击/按键后恢复
+  (function () {
+    const bgm = window.__TomatoBGM;
+    bgm.kick();
+    const kickOnce = () => {
+      bgm.kick();
+      window.removeEventListener('pointerdown', kickOnce);
+      window.removeEventListener('keydown', kickOnce);
+    };
+    window.addEventListener('pointerdown', kickOnce);
+    window.addEventListener('keydown', kickOnce);
+  })();
+  // 音符按钮接线：点击切换播放/静音，按钮外观随状态变化（默认开启）
+  (function () {
+    const noteButton = document.getElementById('musicNoteButton');
+    const refreshNoteButton = isOn => {
+      noteButton.style.color = isOn ? '#ffd93d' : '#6b7683';
+      noteButton.style.opacity = isOn ? '1' : '0.55';
+    };
+    refreshNoteButton(window.__TomatoBGM.isOn());
+    noteButton.addEventListener('click', () => refreshNoteButton(window.__TomatoBGM.toggle()));
+  })();
+</script>
+</body>
+</html>
