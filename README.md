@@ -47,9 +47,3 @@
     地图数据：编辑 backend/data/map.json            → python backend/tools/build_map_data.py
     Excel 互转：python backend/tools/unit_db_excel.py --export / --import
     同步校验：两个 build 工具均支持 --check
-
-## file:// 说明
-
-双击 WG.html 可启动游戏逻辑（计时/布防/性能面板可用），但 Phaser 资源加载
-走 XHR，浏览器对 file:// 强制 CORS 拦截（背景图/Spine 骨架加载失败，画面黑屏）。
-本地游玩请一律通过上面的 HTTP 服务进入。
